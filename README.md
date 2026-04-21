@@ -3,8 +3,8 @@
 概述：智能化论文速递 - 自动获取 arXiv 最新论文，通过 LLM 翻译生成中文摘要和亮点。
 
 <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-  <img src="./images/index.png" alt="index" width="450">
-  <img src="./images/result.png" alt="result" width="450">
+  <img src="./images/index.png" alt="index" width="300">
+  <img src="./images/result.png" alt="result" width="300">
 </div>
 
 ## 更新日志
