@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PaperExpress - 智能化论文速递</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>📄 PaperExpress</h1>
+            <p class="subtitle">智能化论文速递</p>
+        </header>
+
+        <!-- 服务器状态 -->
+        <div class="server-status" id="serverStatus">
+            <span class="status-indicator checking"></span>
+            <span class="status-text">正在检查服务器连接...</span>
+        </div>
+
+        <!-- 配置区 -->
+        <section class="config-section" id="configSection">
+            <h2>⚙️ 配置</h2>
+
+            <div class="form-group">
+                <label>
+                    arXiv 学科分类
+                    <span class="hint">点击加载完整分类列表</span>
+                </label>
+                <button type="button" class="btn btn-secondary btn-small" id="loadCategoriesBtn">
+                    📋 加载完整学科分类
+                </button>
+                <div class="checkbox-group hidden" id="categoryContainer">
+                    <div class="loading-text">正在加载分类...</div>
+                </div>
+                <div class="selected-categories" id="selectedCategories">
+                    <span class="empty">未选择分类，点击上方按钮加载</span>
+                </div>
+            </div>
+
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="timeRange">时间范围</label>
+                    <select id="timeRange">
+                        <option value="1">最近 1 天</option>
+                        <option value="3" selected>最近 3 天</option>
+                        <option value="7">最近 7 天</option>
+                        <option value="14">最近 14 天</option>
+                        <option value="30">最近 30 天</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="maxPapers">最大论文数</label>
+                    <select id="maxPapers">
+                        <option value="10">10 篇</option>
+                        <option value="20" selected>20 篇</option>
+                        <option value="30">30 篇</option>
+                        <option value="50">50 篇</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="form-group">
+                <div class="config-header">
+                    <label>LLM 配置 (OpenAI 兼容格式)</label>
+                    <div class="header-buttons">
+                        <button type="button" class="btn btn-secondary btn-small" id="loadConfigBtn">
+                            📂 加载配置
+                        </button>
+                        <button type="button" class="btn btn-secondary btn-small" id="testConnectionBtn">
+                            🔗 测试连接
+                        </button>
+                    </div>
+                </div>
+                <input type="url" id="llmEndpoint" placeholder="API BaseURL">
+                <div class="hint-text">例如：https://api.openai.com/v1 或 https://ark.cn-beijing.volces.com/api/coding/v3</div>
+                <input type="password" id="llmKey" placeholder="API Key" autocomplete="off">
+                <input type="text" id="llmModel" placeholder="模型名称 (如: gpt-4o-mini)">
+                <div class="test-result-container">
+                    <div class="test-result" id="testResult"></div>
+                </div>
+            </div>
+
+            <button class="btn btn-primary" id="startBtn" disabled>
+                🚀 开始生成论文速递
+            </button>
+        </section>
+
+        <!-- 进度区 -->
+        <section class="progress-section hidden" id="progressSection">
+            <div class="progress-header">
+                <h2>⏳ 处理中...</h2>
+                <span class="progress-status" id="progressStatus">正在获取论文数据</span>
+            </div>
+            <div class="progress-bar-container">
+                <div class="progress-bar" id="progressBar"></div>
+            </div>
+            <div class="progress-details" id="progressDetails"></div>
+        </section>
+
+        <!-- 结果区 -->
+        <section class="results-section hidden" id="resultsSection">
+            <div class="results-header">
+                <h2>📰 论文速递报告</h2>
+                <div class="results-actions">
+                    <button class="btn btn-secondary" id="backBtn">← 返回配置</button>
+                    <button class="btn btn-primary" id="exportBtn">📥 导出 Markdown</button>
+                </div>
+            </div>
+            <div class="results-meta" id="resultsMeta"></div>
+            <div class="papers-container" id="papersContainer"></div>
+        </section>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

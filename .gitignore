@@ -1,0 +1,12 @@
+# 配置文件（包含API Key）
+config.json
+
+# Claude 相关
+.claude/
+
+# 聊天记录
+chat_history_*.txt
+
+# 临时文件
+*.tmp
+*.log
