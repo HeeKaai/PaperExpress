@@ -2,13 +2,10 @@
 
 概述：智能化论文速递 - 自动获取 arXiv 最新论文，通过 LLM 翻译生成中文摘要和亮点。
 
-<div style="display: flex; gap: 10px; flex-wrap: wrap;">
-  <img src="./images/index.png" alt="index" width="300">
-  <img src="./images/result.png" alt="result" width="300">
-</div>
 
 ## 更新日志
 
+- 2026-04-28: 新增并发翻译（可配置并发数）、分类搜索、数学公式渲染、翻译统计面板
 - 2026-04-21: 最小可运行版本落地，支持 arXiv 获取 + LLM 翻译 + Markdown 导出
 
 ## 功能

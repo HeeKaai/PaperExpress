@@ -14,6 +14,9 @@ from urllib.parse import urlparse
 import ssl
 import sys
 import os
+import threading
+import queue
+import time
 
 # arXiv API 命名空间
 ARXIV_NS = {
@@ -272,15 +275,24 @@ def translate_paper(paper, llm_config):
 
     content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
 
+    # 获取 token 使用信息
+    usage = data.get("usage", {})
+    prompt_tokens = usage.get("prompt_tokens", 0)
+    completion_tokens = usage.get("completion_tokens", 0)
+    total_tokens = usage.get("total_tokens", 0)
+
     # 解析结果
     chinese_abstract_match = re.search(r'中文摘要[:：]\s*([\s\S]*?)(?=\n\s*亮点[:：]|$)', content, re.IGNORECASE)
     highlight_match = re.search(r'亮点[:：]\s*(.+)', content, re.IGNORECASE | re.DOTALL)
 
     result = {
         "chineseAbstract": chinese_abstract_match.group(1).strip() if chinese_abstract_match else "解析失败",
-        "highlight": highlight_match.group(1).strip().replace('\n', ' ') if highlight_match else "解析失败"
+        "highlight": highlight_match.group(1).strip().replace('\n', ' ') if highlight_match else "解析失败",
+        "promptTokens": prompt_tokens,
+        "completionTokens": completion_tokens,
+        "totalTokens": total_tokens
     }
-    print(f"[translate] 完成: {paper['title'][:30]}...")
+    print(f"[translate] 完成: {paper['title'][:30]}... tokens: {total_tokens}")
     return result
 
 
@@ -442,6 +454,8 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
                 response = self._handle_fetch(data)
             elif path == "/api/translate":
                 response = self._handle_translate(data)
+            elif path == "/api/translate_batch":
+                response = self._handle_translate_batch(data)
             elif path == "/api/test":
                 response = self._handle_test(data)
             else:
@@ -480,6 +494,90 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
         return {
             "success": True,
             "result": result
+        }
+
+    def _handle_translate_batch(self, data):
+        """批量并发翻译处理"""
+        papers = data.get("papers", [])
+        llm_config = data.get("llm", {})
+        concurrency = max(1, min(10, data.get("concurrency", 3)))  # 限制 1-10 并发
+
+        print(f"[batch] 开始批量翻译 {len(papers)} 篇论文，并发数: {concurrency}")
+
+        result_queue = queue.Queue()
+        paper_queue = queue.Queue()
+
+        # 将论文放入队列，附带原始索引
+        for idx, paper in enumerate(papers):
+            paper_queue.put((idx, paper))
+
+        start_time = time.time()
+
+        def worker():
+            while True:
+                try:
+                    idx, paper = paper_queue.get(block=False)
+                except queue.Empty:
+                    break
+
+                try:
+                    result = translate_paper(paper, llm_config)
+                    result_queue.put((idx, {
+                        "success": True,
+                        "result": result
+                    }))
+                except Exception as e:
+                    result_queue.put((idx, {
+                        "success": False,
+                        "error": str(e),
+                        "result": {
+                            "chineseAbstract": f"翻译失败: {str(e)}",
+                            "highlight": "无法生成亮点",
+                            "promptTokens": 0,
+                            "completionTokens": 0,
+                            "totalTokens": 0
+                        }
+                    }))
+
+                paper_queue.task_done()
+
+        # 启动工作线程
+        threads = []
+        for _ in range(concurrency):
+            t = threading.Thread(target=worker)
+            t.start()
+            threads.append(t)
+
+        # 等待所有线程完成
+        for t in threads:
+            t.join()
+
+        # 按原始顺序整理结果
+        results = [None] * len(papers)
+        while not result_queue.empty():
+            idx, result = result_queue.get()
+            results[idx] = result
+
+        total_time = time.time() - start_time
+
+        # 统计 token 使用
+        total_prompt_tokens = sum(r["result"]["promptTokens"] for r in results if r and r["result"])
+        total_completion_tokens = sum(r["result"]["completionTokens"] for r in results if r and r["result"])
+        total_tokens = sum(r["result"]["totalTokens"] for r in results if r and r["result"])
+
+        print(f"[batch] 完成! 总耗时: {total_time:.1f}s, tokens: {total_tokens}")
+
+        return {
+            "success": True,
+            "results": results,
+            "stats": {
+                "totalPapers": len(papers),
+                "totalTime": round(total_time, 2),
+                "avgTimePerPaper": round(total_time / len(papers), 2) if papers else 0,
+                "promptTokens": total_prompt_tokens,
+                "completionTokens": total_completion_tokens,
+                "totalTokens": total_tokens
+            }
         }
 
     def _handle_test(self, data):
@@ -536,11 +634,12 @@ def run_server(port=8080):
 ║  🚀 服务已启动: http://localhost:{port}                    ║
 ║                                                          ║
 ║  API 端点:                                                ║
-║    - GET  /api/categories  获取学科分类列表               ║
-║    - GET  /api/config       加载配置文件                 ║
-║    - POST /api/fetch       获取 arXiv 论文               ║
-║    - POST /api/translate   翻译单篇论文                  ║
-║    - POST /api/test        测试 LLM 连接                 ║
+║    - GET  /api/categories       获取学科分类列表          ║
+║    - GET  /api/config          加载配置文件              ║
+║    - POST /api/fetch          获取 arXiv 论文            ║
+║    - POST /api/translate      翻译单篇论文               ║
+║    - POST /api/translate_batch 批量翻译(支持并发)        ║
+║    - POST /api/test           测试 LLM 连接              ║
 ║                                                          ║
 ║  在浏览器打开上述地址即可使用                              ║
 ║  按 Ctrl+C 停止服务                                       ║

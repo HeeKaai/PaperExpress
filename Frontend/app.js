@@ -8,6 +8,8 @@ let currentPapers = [];
 let isProcessing = false;
 let categoriesLoaded = false;
 let selectedCategories = new Set();
+let translateStartTime = 0;
+let translationStats = null;
 
 // API 基础 URL - 后端和前端在同一个服务器上，使用相对路径
 const API_BASE = '';
@@ -95,10 +97,12 @@ function setupEventListeners() {
 async function loadCategories() {
     const container = document.getElementById('categoryContainer');
     const loadBtn = document.getElementById('loadCategoriesBtn');
+    const searchInput = document.getElementById('categorySearch');
 
     container.classList.remove('hidden');
     loadBtn.disabled = true;
     loadBtn.textContent = '加载中...';
+    searchInput.style.display = 'block';
 
     try {
         const response = await fetch(`${API_BASE}/api/categories`);
@@ -107,8 +111,8 @@ async function loadCategories() {
         const data = await response.json();
         const categories = data.categories;
 
-        // 清空容器
-        container.innerHTML = '';
+        // 保存所有分类用于搜索
+        window.allCategories = categories;
 
         // 按后端分组显示，保持对齐
         const groups = {
@@ -135,66 +139,32 @@ async function loadCategories() {
             }
         });
 
-        // 整体三列网格布局，前三个分组各占一列，其他占满三列
-        container.style.display = 'grid';
-        container.style.gridTemplateColumns = '1fr 1fr 1fr';
-        container.style.gap = '16px';
+        // 保存分组信息
+        window.categoryGroups = groups;
 
-        Object.entries(groups).forEach(([groupName, items], index) => {
-            if (items.length === 0) return;
+        // 渲染分类
+        renderCategories(groups);
 
-            const groupDiv = document.createElement('div');
-            groupDiv.style.marginBottom = '0';
-            if (groupName === '其他') {
-                groupDiv.style.gridColumn = '1 / -1';
+        // 设置搜索
+        searchInput.addEventListener('input', (e) => {
+            const query = e.target.value.toLowerCase().trim();
+            if (!query) {
+                renderCategories(groups);
+                return;
             }
 
-            const groupTitle = document.createElement('div');
-            groupTitle.textContent = groupName;
-            groupTitle.style.fontWeight = '600';
-            groupTitle.style.fontSize = '0.85rem';
-            groupTitle.style.color = 'var(--text-secondary)';
-            groupTitle.style.marginBottom = '8px';
-            groupDiv.appendChild(groupTitle);
-
-            const itemsDiv = document.createElement('div');
-            itemsDiv.style.display = 'flex';
-            itemsDiv.style.flexDirection = 'column';
-            itemsDiv.style.gap = '8px';
-
-            items.forEach(([code, name]) => {
-                const label = document.createElement('label');
-                label.className = 'checkbox-item';
-                label.style.marginBottom = '0';
-
-                const checkbox = document.createElement('input');
-                checkbox.type = 'checkbox';
-                checkbox.value = code;
-                checkbox.addEventListener('change', () => {
-                    if (checkbox.checked) {
-                        selectedCategories.add(code);
-                    } else {
-                        selectedCategories.delete(code);
-                    }
-                    updateSelectedCategoriesDisplay();
-                    updateStartButton();
-                });
-
-                // 恢复之前的选中状态
-                if (selectedCategories.has(code)) {
-                    checkbox.checked = true;
+            // 过滤匹配的分类
+            const filteredGroups = {};
+            Object.entries(groups).forEach(([groupName, items]) => {
+                const filtered = items.filter(([code, name]) =>
+                    code.toLowerCase().includes(query) || name.toLowerCase().includes(query)
+                );
+                if (filtered.length > 0) {
+                    filteredGroups[groupName] = filtered;
                 }
-
-                const span = document.createElement('span');
-                span.innerHTML = `<span class="cat-code">${code}</span> ${name}`;
-
-                label.appendChild(checkbox);
-                label.appendChild(span);
-                itemsDiv.appendChild(label);
             });
 
-            groupDiv.appendChild(itemsDiv);
-            container.appendChild(groupDiv);
+            renderCategories(filteredGroups);
         });
 
         categoriesLoaded = true;
@@ -207,6 +177,79 @@ async function loadCategories() {
         loadBtn.disabled = false;
         loadBtn.textContent = '📋 重新加载分类';
     }
+}
+
+// 渲染分类列表
+function renderCategories(groups) {
+    const container = document.getElementById('categoryContainer');
+    const searchInput = document.getElementById('categorySearch');
+
+    // 保留搜索框，清空其他内容
+    Array.from(container.children).forEach(child => {
+        if (child.id !== 'categorySearch') child.remove();
+    });
+
+    // 整体三列网格布局，前三个分组各占一列，其他占满三列
+    container.style.display = 'grid';
+    container.style.gridTemplateColumns = '1fr 1fr 1fr';
+    container.style.gap = '16px';
+
+    Object.entries(groups).forEach(([groupName, items], index) => {
+        if (items.length === 0) return;
+
+        const groupDiv = document.createElement('div');
+        groupDiv.style.marginBottom = '0';
+        if (groupName === '其他') {
+            groupDiv.style.gridColumn = '1 / -1';
+        }
+
+        const groupTitle = document.createElement('div');
+        groupTitle.textContent = groupName;
+        groupTitle.style.fontWeight = '600';
+        groupTitle.style.fontSize = '0.85rem';
+        groupTitle.style.color = 'var(--text-secondary)';
+        groupTitle.style.marginBottom = '8px';
+        groupDiv.appendChild(groupTitle);
+
+        const itemsDiv = document.createElement('div');
+        itemsDiv.style.display = 'flex';
+        itemsDiv.style.flexDirection = 'column';
+        itemsDiv.style.gap = '8px';
+
+        items.forEach(([code, name]) => {
+            const label = document.createElement('label');
+            label.className = 'checkbox-item';
+            label.style.marginBottom = '0';
+
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.value = code;
+            checkbox.addEventListener('change', () => {
+                if (checkbox.checked) {
+                    selectedCategories.add(code);
+                } else {
+                    selectedCategories.delete(code);
+                }
+                updateSelectedCategoriesDisplay();
+                updateStartButton();
+            });
+
+            // 恢复之前的选中状态
+            if (selectedCategories.has(code)) {
+                checkbox.checked = true;
+            }
+
+            const span = document.createElement('span');
+            span.innerHTML = `<span class="cat-code">${code}</span> ${name}`;
+
+            label.appendChild(checkbox);
+            label.appendChild(span);
+            itemsDiv.appendChild(label);
+        });
+
+        groupDiv.appendChild(itemsDiv);
+        container.appendChild(groupDiv);
+    });
 }
 
 // 更新已选分类显示
@@ -324,6 +367,7 @@ async function handleStart() {
 
     isProcessing = true;
     currentPapers = [];
+    translateStartTime = Date.now();
 
     showSection('progress');
     document.getElementById('progressDetails').innerHTML = '';
@@ -358,66 +402,52 @@ async function handleStart() {
             throw new Error('未找到符合条件的论文，请尝试调整分类或时间范围');
         }
 
-        // 步骤2: 翻译论文
-        updateProgress(35, '正在翻译摘要...', '开始调用 LLM 进行翻译...');
+        // 步骤2: 批量翻译论文（并发）
+        updateProgress(35, `翻译中...`, `开始调用 LLM 并发翻译 ${papers.length} 篇论文 (${config.concurrency} 并发)...`);
 
-        const translatedPapers = [];
-        const llmConfig = config.llm;
+        const translateResponse = await fetch(`${API_BASE}/api/translate_batch`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                papers: papers,
+                llm: config.llm,
+                concurrency: config.concurrency
+            })
+        });
 
-        for (let i = 0; i < papers.length; i++) {
-            const paper = papers[i];
-
-            try {
-                const translateResponse = await fetch(`${API_BASE}/api/translate`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        paper: paper,
-                        llm: llmConfig
-                    })
-                });
-
-                if (!translateResponse.ok) {
-                    throw new Error('翻译请求失败');
-                }
-
-                const translateData = await translateResponse.json();
-                const result = translateData.result || {};
-
-                translatedPapers.push({
-                    ...paper,
-                    chineseAbstract: result.chineseAbstract || '解析失败',
-                    highlight: result.highlight || '解析失败'
-                });
-
-                updateProgress(
-                    35 + Math.round(((i + 1) / papers.length) * 60),
-                    `正在翻译: ${i + 1}/${papers.length}`,
-                    `✓ [${i + 1}/${papers.length}] ${paper.title.substring(0, 50)}...`
-                );
-
-            } catch (error) {
-                translatedPapers.push({
-                    ...paper,
-                    chineseAbstract: `翻译失败: ${error.message}`,
-                    highlight: '无法生成亮点',
-                    translationError: true
-                });
-
-                updateProgress(
-                    35 + Math.round(((i + 1) / papers.length) * 60),
-                    `正在翻译: ${i + 1}/${papers.length}`,
-                    `✗ [${i + 1}/${papers.length}] ${paper.title.substring(0, 50)}... 失败: ${error.message}`
-                );
-            }
+        if (!translateResponse.ok) {
+            throw new Error('批量翻译请求失败');
         }
+
+        const translateData = await translateResponse.json();
+        const results = translateData.results || [];
+        translationStats = translateData.stats || {};
+
+        // 合并翻译结果
+        const translatedPapers = papers.map((paper, i) => {
+            const result = results[i] || { result: {} };
+            const hasError = !result.success;
+            return {
+                ...paper,
+                chineseAbstract: result.result.chineseAbstract || '解析失败',
+                highlight: result.result.highlight || '解析失败',
+                translationError: hasError,
+                tokenUsage: {
+                    promptTokens: result.result.promptTokens || 0,
+                    completionTokens: result.result.completionTokens || 0,
+                    totalTokens: result.result.totalTokens || 0
+                }
+            };
+        });
 
         // 步骤3: 展示结果
         currentPapers = translatedPapers;
-        renderResults(currentPapers, config);
+        renderResults(currentPapers, config, translationStats);
         showSection('results');
+
+        updateProgress(100, '处理完成!', '');
 
     } catch (error) {
         updateProgress(0, '处理失败', `✗ 错误: ${error.message}`);
@@ -434,6 +464,7 @@ function getConfig() {
         categories: Array.from(selectedCategories),
         timeRange: parseInt(document.getElementById('timeRange').value),
         maxPapers: parseInt(document.getElementById('maxPapers').value),
+        concurrency: parseInt(document.getElementById('concurrency').value),
         llm: getLLMConfig()
     };
 }
@@ -470,9 +501,26 @@ function updateProgress(percent, status, detail = '') {
 }
 
 // 渲染结果
-function renderResults(papers, config) {
+function renderResults(papers, config, stats) {
     const container = document.getElementById('papersContainer');
     const meta = document.getElementById('resultsMeta');
+    const statsPanel = document.getElementById('statsPanel');
+
+    // 显示统计信息
+    if (stats) {
+        statsPanel.style.display = 'block';
+        // 模型名称
+        const modelName = config.llm.model || 'doubao-seed-2.0-lite';
+        document.getElementById('statModel').textContent = modelName.length > 15 ? modelName.substring(0, 15) + '...' : modelName;
+        // 总 Tokens
+        document.getElementById('statTotalTokens').textContent = stats.totalTokens.toLocaleString();
+        // 总耗时
+        document.getElementById('statTotalTime').textContent = `${Math.round(stats.totalTime)}s`;
+        // 平均每篇耗时
+        document.getElementById('statAvgTime').textContent = `${stats.avgTimePerPaper.toFixed(1)}s`;
+    } else {
+        statsPanel.style.display = 'none';
+    }
 
     // 元信息
     const categories = config.categories.slice(0, 5).join(', ') + (config.categories.length > 5 ? ` 等${config.categories.length}个分类` : '');
@@ -480,7 +528,8 @@ function renderResults(papers, config) {
     meta.innerHTML = `
         <strong>分类:</strong> ${categories} |
         <strong>时间范围:</strong> ${dateRange} |
-        <strong>共 ${papers.length} 篇论文</strong>
+        <strong>共 ${papers.length} 篇论文</strong> |
+        <strong>并发数:</strong> ${config.concurrency}
     `;
 
     // 清空容器
@@ -494,17 +543,21 @@ function renderResults(papers, config) {
         const authors = paper.authors.slice(0, 5).join(', ') +
             (paper.authors.length > 5 ? ` 等 ${paper.authors.length} 位作者` : '');
 
+        // 先转义 HTML，然后数学公式会在渲染后处理
+        const highlightText = escapeHtml(paper.highlight || '');
+        const abstractText = escapeHtml(paper.chineseAbstract || '');
+
         const highlightHtml = paper.highlight && !paper.translationError ? `
             <div class="paper-highlight">
                 <div class="paper-highlight-label">✨ 一句话亮点</div>
-                <div class="paper-highlight-text">${escapeHtml(paper.highlight)}</div>
+                <div class="paper-highlight-text render-math">${highlightText}</div>
             </div>
         ` : '';
 
         const abstractHtml = paper.chineseAbstract ? `
             <div class="paper-abstract">
                 <div class="paper-abstract-label">📝 中文摘要</div>
-                <div>${escapeHtml(paper.chineseAbstract)}</div>
+                <div class="render-math">${abstractText}</div>
             </div>
         ` : '';
 
@@ -529,6 +582,53 @@ function renderResults(papers, config) {
 
         container.appendChild(card);
     });
+
+    // 渲染数学公式
+    renderMathInElement(container);
+}
+
+// 渲染数学公式（避免无限递归）
+function renderMathInElement(element) {
+    if (typeof katex === 'undefined') return;
+
+    try {
+        // 只渲染标记为 .render-math 的元素
+        const mathElements = element.querySelectorAll('.render-math');
+        mathElements.forEach(el => {
+            // 使用 textContent 获取原始文本，避免 HTML 实体问题
+            let text = el.textContent;
+            let hasFormula = false;
+
+            // 1. 先处理数学公式 $...$
+            const formulaRegex = /\$([^\$]+)\$/g;
+            text = text.replace(formulaRegex, (match, formula) => {
+                try {
+                    if (formula.length > 200) return match;  // 跳过过长的公式
+                    hasFormula = true;
+                    return katex.renderToString(formula, {
+                        throwOnError: false,
+                        displayMode: false
+                    });
+                } catch (e) {
+                    return match;
+                }
+            });
+
+            // 2. 处理 Markdown 粗体 **...**
+            const boldRegex = /\*\*([^\*]+)\*\*/g;
+            if (boldRegex.test(text)) {
+                text = text.replace(boldRegex, '<strong>$1</strong>');
+                hasFormula = true;
+            }
+
+            // 只有包含公式或粗体时才更新，避免不必要的重新渲染
+            if (hasFormula) {
+                el.innerHTML = text;
+            }
+        });
+    } catch (e) {
+        console.warn('Rendering skipped:', e.message);
+    }
 }
 
 // 导出为 Markdown
@@ -572,6 +672,7 @@ function exportToMarkdown() {
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
 }
+
 
 // HTML 转义
 function escapeHtml(text) {

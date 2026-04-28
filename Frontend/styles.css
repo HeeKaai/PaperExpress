@@ -131,7 +131,7 @@ section h2 {
 
 .form-row {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: 1fr 1fr 1fr;
     gap: 16px;
 }
 
@@ -430,19 +430,20 @@ select:focus {
 
 .progress-bar {
     height: 100%;
-    background: linear-gradient(90deg, var(--primary-color), #3b82f6);
+    background: linear-gradient(90deg, var(--primary-color), #764ba2);
     border-radius: 4px;
     transition: width 0.3s ease;
     width: 0%;
 }
 
 .progress-details {
-    padding: 12px;
+    padding: 16px;
     background: var(--bg-color);
     border-radius: var(--radius);
-    font-size: 0.9rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+    font-size: 0.8rem;
     color: var(--text-secondary);
-    max-height: 200px;
+    max-height: 300px;
     overflow-y: auto;
 }
 
@@ -670,4 +671,20 @@ select:focus {
 
 ::-webkit-scrollbar-thumb:hover {
     background: #94a3b8;
+}
+
+/* KaTeX Math Rendering */
+.katex {
+    font-size: 1.1em !important;
+}
+
+.katex-display {
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 8px 0;
+}
+
+/* Category Search */
+.category-search {
+    grid-column: 1 / -1 !important;
 }
