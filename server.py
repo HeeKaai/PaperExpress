@@ -9,6 +9,7 @@ import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from urllib import request, error, parse
 from urllib.parse import urlparse
 import ssl
@@ -17,6 +18,148 @@ import os
 import threading
 import queue
 import time
+import hashlib
+
+# 项目数据目录
+DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
+PAPERS_DIR = os.path.join(DATA_DIR, 'papers')
+INTENSIVE_DIR = os.path.join(DATA_DIR, 'intensive')
+INDEX_FILE = os.path.join(DATA_DIR, 'index.json')
+
+
+def ensure_data_dirs():
+    """确保数据目录存在"""
+    for d in [DATA_DIR, PAPERS_DIR, INTENSIVE_DIR]:
+        if not os.path.exists(d):
+            os.makedirs(d, exist_ok=True)
+
+
+def load_index():
+    """加载索引文件"""
+    ensure_data_dirs()
+    if not os.path.exists(INDEX_FILE):
+        return {"papers": {}, "intensive": {}}
+    try:
+        with open(INDEX_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {"papers": {}, "intensive": {}}
+
+
+def save_index(index):
+    """保存索引文件"""
+    ensure_data_dirs()
+    with open(INDEX_FILE, 'w', encoding='utf-8') as f:
+        json.dump(index, f, ensure_ascii=False, indent=2)
+
+
+def compute_hash(*parts):
+    """计算配置的哈希值（用于缓存键）"""
+    combined = '|'.join(str(p) for p in parts)
+    return hashlib.md5(combined.encode('utf-8')).hexdigest()[:16]
+
+
+def paper_config_hash(categories, time_range, max_papers):
+    """论文速递配置的哈希值"""
+    cats = ','.join(sorted(categories))
+    return compute_hash(cats, time_range, max_papers)
+
+
+def intensive_hash(arXiv_id, paper_title):
+    """精读记录的哈希值（基于论文ID和标题）"""
+    return compute_hash(arXiv_id, paper_title[:100])
+
+
+def get_papers_record(hash_key):
+    """获取论文速递记录"""
+    path = os.path.join(PAPERS_DIR, f"{hash_key}.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_papers_record(hash_key, record):
+    """保存论文速递记录"""
+    ensure_data_dirs()
+    path = os.path.join(PAPERS_DIR, f"{hash_key}.json")
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(record, f, ensure_ascii=False, indent=2)
+
+    # 更新索引
+    index = load_index()
+    index['papers'][hash_key] = {
+        "title": record.get('title', '未命名'),
+        "created": record.get('created', datetime.now().isoformat()),
+        "count": record.get('count', 0)
+    }
+    save_index(index)
+
+
+def get_intensive_record(hash_key):
+    """获取精读记录"""
+    path = os.path.join(INTENSIVE_DIR, f"{hash_key}.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_intensive_record(hash_key, record):
+    """保存精读记录"""
+    ensure_data_dirs()
+    path = os.path.join(INTENSIVE_DIR, f"{hash_key}.json")
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(record, f, ensure_ascii=False, indent=2)
+
+    # 更新索引
+    index = load_index()
+    index['intensive'][hash_key] = {
+        "paperTitle": record.get('paperTitle', '')[:80],
+        "arXivId": record.get('arXivId', ''),
+        "created": record.get('created', datetime.now().isoformat())
+    }
+    save_index(index)
+
+
+def delete_papers_record(hash_key):
+    """删除论文速递记录"""
+    path = os.path.join(PAPERS_DIR, f"{hash_key}.json")
+    if os.path.exists(path):
+        os.remove(path)
+    index = load_index()
+    if hash_key in index['papers']:
+        del index['papers'][hash_key]
+        save_index(index)
+
+
+def delete_intensive_record(hash_key):
+    """删除精读记录"""
+    path = os.path.join(INTENSIVE_DIR, f"{hash_key}.json")
+    if os.path.exists(path):
+        os.remove(path)
+    index = load_index()
+    if hash_key in index['intensive']:
+        del index['intensive'][hash_key]
+        save_index(index)
+
+
+def list_history():
+    """列出所有历史记录"""
+    index = load_index()
+    # 附加完整记录信息
+    for key, meta in index['papers'].items():
+        record = get_papers_record(key)
+        if record:
+            meta['papers'] = record.get('papers', [])
+            meta['stats'] = record.get('stats', {})
+    return index
 
 # arXiv API 命名空间
 ARXIV_NS = {
@@ -296,6 +439,120 @@ def translate_paper(paper, llm_config):
     return result
 
 
+def intensive_read_paper(paper, llm_config):
+    """使用 LLM 对论文进行精读分析"""
+
+    api_url = llm_config.get("endpoint", "")
+    api_key = llm_config.get("key", "")
+    model_name = llm_config.get("model", "")
+
+    # 自动补全 /chat/completions 如果没有
+    if not api_url.endswith('/chat/completions'):
+        api_url = api_url.rstrip('/') + '/chat/completions'
+
+    # 读取精读提示词模板
+    prompt_template_path = os.path.join(os.path.dirname(__file__), 'Prompts', 'intensive_reading_prompt.txt')
+
+    try:
+        with open(prompt_template_path, 'r', encoding='utf-8') as f:
+            prompt_template = f.read()
+    except Exception as e:
+        raise Exception(f"无法读取精读提示词模板: {str(e)}")
+
+    # 构建论文内容
+    authors_str = ', '.join(paper.get('authors', []))
+    categories_str = ', '.join(paper.get('categories', []))
+
+    paper_content = f"""论文标题: {paper.get('title', '')}
+
+作者: {authors_str}
+
+arXiv ID: {paper.get('id', '')}
+
+发布日期: {paper.get('published', '')}
+
+分类: {categories_str}
+
+摘要:
+{paper.get('abstract', '')}"""
+
+    # 使用模板生成提示词
+    prompt = f"""{prompt_template}
+
+======================
+请开始分析以下论文：
+======================
+
+{paper_content}"""
+
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.7,
+        "max_tokens": 8000
+    }
+
+    # 重试机制
+    max_retries = 2
+    last_error = None
+    print(f"[intensive_read] 开始精读: {paper.get('title', '')[:50]}...")
+
+    for retry in range(max_retries):
+        if retry > 0:
+            import time
+            print(f"[intensive_read] 重试第 {retry + 1}/{max_retries} 次...")
+            time.sleep(2)
+
+        req = request.Request(
+            api_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "PaperExpress/1.0"
+            },
+            method="POST"
+        )
+
+        ssl_context = ssl.create_default_context()
+
+        try:
+            with request.urlopen(req, context=ssl_context, timeout=300) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            break
+        except error.HTTPError as e:
+            error_body = e.read().decode("utf-8")
+            try:
+                error_json = json.loads(error_body)
+                error_msg = error_json.get("error", {}).get("message", str(e))
+            except:
+                error_msg = error_body or str(e)
+            last_error = f"LLM API 错误: {error_msg}"
+        except error.URLError as e:
+            last_error = f"连接超时，请检查网络或API地址: {str(e)}"
+        except Exception as e:
+            last_error = f"请求错误: {str(e)}"
+    else:
+        raise Exception(last_error)
+
+    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+    # 获取 token 使用信息
+    usage = data.get("usage", {})
+    prompt_tokens = usage.get("prompt_tokens", 0)
+    completion_tokens = usage.get("completion_tokens", 0)
+    total_tokens = usage.get("total_tokens", 0)
+
+    result = {
+        "content": content,
+        "promptTokens": prompt_tokens,
+        "completionTokens": completion_tokens,
+        "totalTokens": total_tokens
+    }
+    print(f"[intensive_read] 完成: {paper.get('title', '')[:30]}... tokens: {total_tokens}")
+    return result
+
+
 def test_llm_connection(llm_config):
     """测试 LLM 连接"""
 
@@ -348,6 +605,12 @@ def test_llm_connection(llm_config):
         return {"success": False, "message": f"连接失败: {str(e)}"}
     except Exception as e:
         return {"success": False, "message": f"错误: {str(e)}"}
+
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """支持多线程的 HTTP 服务器"""
+    daemon_threads = True
+    allow_reuse_address = True
 
 
 class PaperExpressHandler(BaseHTTPRequestHandler):
@@ -409,7 +672,7 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
         self.send_response(status_code)
         self.send_header("Content-Type", content_type)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
@@ -419,13 +682,29 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         """处理 GET 请求"""
+        path = self.path
+
         # API 请求
-        if self.path == "/api/categories":
+        if path == "/api/categories":
             self._set_headers()
             response = {"success": True, "categories": ARXIV_CATEGORIES}
             self.wfile.write(json.dumps(response, ensure_ascii=False).encode("utf-8"))
-        elif self.path == "/api/config":
+        elif path == "/api/config":
             response = self._handle_load_config()
+            self._set_headers()
+            self.wfile.write(json.dumps(response, ensure_ascii=False).encode("utf-8"))
+        elif path == "/api/history/list":
+            response = self._handle_history_list()
+            self._set_headers()
+            self.wfile.write(json.dumps(response, ensure_ascii=False).encode("utf-8"))
+        elif path.startswith("/api/history/papers/"):
+            hash_key = path.split("/")[-1]
+            response = self._handle_history_papers_get(hash_key)
+            self._set_headers()
+            self.wfile.write(json.dumps(response, ensure_ascii=False).encode("utf-8"))
+        elif path.startswith("/api/history/intensive/"):
+            hash_key = path.split("/")[-1]
+            response = self._handle_history_intensive_get(hash_key)
             self._set_headers()
             self.wfile.write(json.dumps(response, ensure_ascii=False).encode("utf-8"))
         else:
@@ -433,6 +712,37 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
             if not self.serve_static_file(self.path):
                 self._set_headers(404, "application/json")
                 self.wfile.write(json.dumps({"error": "Not found"}).encode())
+
+    def do_DELETE(self):
+        """处理 DELETE 请求"""
+        path = self.path
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            self._set_headers(400)
+            self.wfile.write(json.dumps({"error": "Invalid JSON"}).encode())
+            return
+
+        try:
+            if path.startswith("/api/history/papers/"):
+                hash_key = path.split("/")[-1]
+                response = self._handle_history_papers_delete(hash_key)
+                self._set_headers()
+                self.wfile.write(json.dumps(response, ensure_ascii=False).encode("utf-8"))
+            elif path.startswith("/api/history/intensive/"):
+                hash_key = path.split("/")[-1]
+                response = self._handle_history_intensive_delete(hash_key)
+                self._set_headers()
+                self.wfile.write(json.dumps(response, ensure_ascii=False).encode("utf-8"))
+            else:
+                self._set_headers(404)
+                self.wfile.write(json.dumps({"error": "Not found"}).encode())
+        except Exception as e:
+            self._set_headers(500)
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
 
     def do_POST(self):
         """处理 POST 请求"""
@@ -458,6 +768,10 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
                 response = self._handle_translate_batch(data)
             elif path == "/api/test":
                 response = self._handle_test(data)
+            elif path == "/api/intensive_read":
+                response = self._handle_intensive_read(data)
+            elif path == "/api/history/check":
+                response = self._handle_history_check(data)
             else:
                 self._set_headers(404)
                 self.wfile.write(json.dumps({"error": "Not found"}).encode())
@@ -501,6 +815,24 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
         papers = data.get("papers", [])
         llm_config = data.get("llm", {})
         concurrency = max(1, min(10, data.get("concurrency", 3)))  # 限制 1-10 并发
+        categories = data.get("categories", [])
+        time_range = data.get("timeRange", 3)
+        max_papers = data.get("maxPapers", 20)
+        model_name = llm_config.get("model", "")
+
+        # 检查缓存
+        cache_hash = paper_config_hash(categories, time_range, max_papers)
+        cached = get_papers_record(cache_hash)
+        if cached:
+            print(f"[batch] 命中缓存: {cache_hash}, {len(papers)} 篇论文")
+            return {
+                "success": True,
+                "results": cached.get("results", []),
+                "stats": cached.get("stats", {}),
+                "papers": cached.get("papers", []),
+                "cached": True,
+                "cacheCreated": cached.get("created", "")
+            }
 
         print(f"[batch] 开始批量翻译 {len(papers)} 篇论文，并发数: {concurrency}")
 
@@ -567,17 +899,37 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
 
         print(f"[batch] 完成! 总耗时: {total_time:.1f}s, tokens: {total_tokens}")
 
+        stats = {
+            "totalPapers": len(papers),
+            "totalTime": round(total_time, 2),
+            "avgTimePerPaper": round(total_time / len(papers), 2) if papers else 0,
+            "promptTokens": total_prompt_tokens,
+            "completionTokens": total_completion_tokens,
+            "totalTokens": total_tokens
+        }
+
+        # 保存到缓存
+        cat_names = ','.join(sorted(categories))
+        cache_record = {
+            "title": f"论文速递: {cat_names}",
+            "categories": categories,
+            "timeRange": time_range,
+            "maxPapers": max_papers,
+            "model": model_name,
+            "papers": papers,
+            "results": results,
+            "stats": stats,
+            "created": datetime.now().isoformat()
+        }
+        save_papers_record(cache_hash, cache_record)
+        print(f"[batch] 已保存缓存: {cache_hash}")
+
         return {
             "success": True,
             "results": results,
-            "stats": {
-                "totalPapers": len(papers),
-                "totalTime": round(total_time, 2),
-                "avgTimePerPaper": round(total_time / len(papers), 2) if papers else 0,
-                "promptTokens": total_prompt_tokens,
-                "completionTokens": total_completion_tokens,
-                "totalTokens": total_tokens
-            }
+            "stats": stats,
+            "papers": papers,
+            "cached": False
         }
 
     def _handle_test(self, data):
@@ -587,6 +939,122 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
         result = test_llm_connection(llm_config)
 
         return result
+
+    def _handle_intensive_read(self, data):
+        """处理论文精读请求"""
+        paper = data.get("paper", {})
+        llm_config = data.get("llm", {})
+        save_cache = data.get("saveCache", True)  # 是否保存缓存
+
+        if not paper:
+            return {"success": False, "error": "论文数据不能为空"}
+
+        arXiv_id = paper.get("id", "")
+        paper_title = paper.get("title", "")
+
+        # 先检查缓存
+        if save_cache:
+            cache_hash = intensive_hash(arXiv_id, paper_title)
+            cached = get_intensive_record(cache_hash)
+            if cached:
+                print(f"[intensive_read] 命中缓存: {paper_title[:30]}...")
+                return {
+                    "success": True,
+                    "result": cached.get("result", {}),
+                    "cached": True,
+                    "cacheCreated": cached.get("created", "")
+                }
+
+        result = intensive_read_paper(paper, llm_config)
+
+        # 保存缓存
+        if save_cache:
+            cache_record = {
+                "paperTitle": paper_title,
+                "arXivId": arXiv_id,
+                "paper": paper,
+                "result": result,
+                "created": datetime.now().isoformat()
+            }
+            save_intensive_record(cache_hash, cache_record)
+            print(f"[intensive_read] 已保存缓存: {paper_title[:30]}...")
+
+        return {
+            "success": True,
+            "result": result,
+            "cached": False
+        }
+
+    def _handle_history_check(self, data):
+        """检查历史缓存是否存在"""
+        check_type = data.get("type", "")  # "papers" or "intensive"
+
+        if check_type == "papers":
+            categories = data.get("categories", [])
+            time_range = data.get("timeRange", 3)
+            max_papers = data.get("maxPapers", 20)
+            cache_hash = paper_config_hash(categories, time_range, max_papers)
+            cached = get_papers_record(cache_hash)
+            if cached:
+                return {
+                    "success": True,
+                    "cached": True,
+                    "hash": cache_hash,
+                    "title": cached.get("title", ""),
+                    "created": cached.get("created", ""),
+                    "count": cached.get("count", 0)
+                }
+            return {"success": True, "cached": False, "hash": cache_hash}
+
+        elif check_type == "intensive":
+            arXiv_id = data.get("arXivId", "")
+            paper_title = data.get("paperTitle", "")
+            cache_hash = intensive_hash(arXiv_id, paper_title)
+            cached = get_intensive_record(cache_hash)
+            if cached:
+                return {
+                    "success": True,
+                    "cached": True,
+                    "hash": cache_hash,
+                    "paperTitle": cached.get("paperTitle", ""),
+                    "created": cached.get("created", "")
+                }
+            return {"success": True, "cached": False, "hash": cache_hash}
+
+        return {"success": False, "error": "未知的检查类型"}
+
+    def _handle_history_list(self):
+        """获取所有历史记录列表"""
+        index = load_index()
+        return {
+            "success": True,
+            "papers": index.get("papers", {}),
+            "intensive": index.get("intensive", {})
+        }
+
+    def _handle_history_papers_get(self, hash_key):
+        """获取指定论文速递记录"""
+        record = get_papers_record(hash_key)
+        if record:
+            return {"success": True, "record": record}
+        return {"success": False, "error": "记录不存在"}
+
+    def _handle_history_papers_delete(self, hash_key):
+        """删除论文速递记录"""
+        delete_papers_record(hash_key)
+        return {"success": True}
+
+    def _handle_history_intensive_get(self, hash_key):
+        """获取指定精读记录"""
+        record = get_intensive_record(hash_key)
+        if record:
+            return {"success": True, "record": record}
+        return {"success": False, "error": "记录不存在"}
+
+    def _handle_history_intensive_delete(self, hash_key):
+        """删除精读记录"""
+        delete_intensive_record(hash_key)
+        return {"success": True}
 
     def _handle_load_config(self):
         """加载配置文件"""
@@ -625,7 +1093,7 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
 def run_server(port=8080):
     """启动服务器"""
     server_address = ("", port)
-    httpd = HTTPServer(server_address, PaperExpressHandler)
+    httpd = ThreadedHTTPServer(server_address, PaperExpressHandler)
 
     print(f"""
 ╔══════════════════════════════════════════════════════════╗
@@ -639,6 +1107,7 @@ def run_server(port=8080):
 ║    - POST /api/fetch          获取 arXiv 论文            ║
 ║    - POST /api/translate      翻译单篇论文               ║
 ║    - POST /api/translate_batch 批量翻译(支持并发)        ║
+║    - POST /api/intensive_read  论文精读分析              ║
 ║    - POST /api/test           测试 LLM 连接              ║
 ║                                                          ║
 ║  在浏览器打开上述地址即可使用                              ║

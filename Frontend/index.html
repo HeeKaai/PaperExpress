@@ -97,6 +97,10 @@
             <button class="btn btn-primary" id="startBtn" disabled>
                 🚀 开始生成论文速递
             </button>
+
+            <button type="button" class="btn btn-secondary" id="homeHistoryBtn" style="margin-top: 12px; width: 100%;">
+                📋 查看历史记录
+            </button>
         </section>
 
         <!-- 进度区 -->
@@ -148,5 +152,55 @@
 
     <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
     <script src="app.js"></script>
+
+    <!-- 精读弹窗 -->
+    <div id="intensiveReadModal" class="modal-overlay hidden">
+        <div class="modal-container">
+            <div class="modal-header">
+                <div class="modal-header-content">
+                    <h3 id="modalTitle">📖 论文精读</h3>
+                    <div class="modal-processing hidden" id="modalProcessing">
+                        <span class="processing-dot"></span>
+                        <span class="processing-dot"></span>
+                        <span class="processing-dot"></span>
+                    </div>
+                </div>
+                <button class="modal-close" onclick="closeIntensiveReadModal()">&times;</button>
+            </div>
+            <div class="modal-body" id="modalBody">
+                <div class="modal-loading" id="modalLoading">
+                    <div class="loading-spinner"></div>
+                    <p>正在分析论文，请稍候...</p>
+                    <p class="loading-hint">（论文精读需要较长时间，请耐心等待）</p>
+                </div>
+                <div class="modal-content hidden" id="modalContent"></div>
+                <div class="modal-error hidden" id="modalError"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary btn-small" onclick="closeIntensiveReadModal()">关闭</button>
+                <button class="btn btn-primary btn-small" onclick="exportIntensiveRead()">📥 导出精读结果</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 历史记录弹窗 -->
+    <div id="historyModal" class="modal-overlay hidden">
+        <div class="modal-container">
+            <div class="modal-header" style="background: linear-gradient(135deg, #0891b2 0%, #06b6d4 100%);">
+                <h3>📋 历史记录</h3>
+                <button class="modal-close" onclick="closeHistoryModal()">&times;</button>
+            </div>
+            <div class="modal-body" id="historyModalBody">
+                <div class="modal-loading" id="historyLoading">
+                    <div class="loading-spinner"></div>
+                    <p>正在加载历史记录...</p>
+                </div>
+                <div class="history-content hidden" id="historyContent"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary btn-small" onclick="closeHistoryModal()">关闭</button>
+            </div>
+        </div>
+    </div>
 </body>
 </html>

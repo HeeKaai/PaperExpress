@@ -10,3 +10,6 @@ chat_history_*.txt
 # 临时文件
 *.tmp
 *.log
+
+# 历史记录数据（本地存储，请勿上传）
+data/

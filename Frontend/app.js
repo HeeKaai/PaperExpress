@@ -91,6 +91,9 @@ function setupEventListeners() {
 
     // 导出按钮
     exportBtn.addEventListener('click', exportToMarkdown);
+
+    // 首页历史记录按钮
+    document.getElementById('homeHistoryBtn').addEventListener('click', openHistoryModal);
 }
 
 // 加载学科分类
@@ -413,7 +416,10 @@ async function handleStart() {
             body: JSON.stringify({
                 papers: papers,
                 llm: config.llm,
-                concurrency: config.concurrency
+                concurrency: config.concurrency,
+                categories: config.categories,
+                timeRange: config.timeRange,
+                maxPapers: config.maxPapers
             })
         });
 
@@ -424,6 +430,12 @@ async function handleStart() {
         const translateData = await translateResponse.json();
         const results = translateData.results || [];
         translationStats = translateData.stats || {};
+
+        // 如果命中缓存，使用缓存中的数据和 papers
+        if (translateData.cached) {
+            const cachedDate = new Date(translateData.cacheCreated).toLocaleString('zh-CN');
+            updateProgress(80, '加载中...', `✓ 命中历史缓存 (${cachedDate})，正在加载...`);
+        }
 
         // 合并翻译结果
         const translatedPapers = papers.map((paper, i) => {
@@ -444,10 +456,10 @@ async function handleStart() {
 
         // 步骤3: 展示结果
         currentPapers = translatedPapers;
-        renderResults(currentPapers, config, translationStats);
+        renderResults(currentPapers, config, translationStats, translateData.cached);
         showSection('results');
 
-        updateProgress(100, '处理完成!', '');
+        updateProgress(100, '处理完成!', translateData.cached ? '✓ 结果来自历史缓存' : '');
 
     } catch (error) {
         updateProgress(0, '处理失败', `✗ 错误: ${error.message}`);
@@ -501,10 +513,11 @@ function updateProgress(percent, status, detail = '') {
 }
 
 // 渲染结果
-function renderResults(papers, config, stats) {
+function renderResults(papers, config, stats, cached) {
     const container = document.getElementById('papersContainer');
     const meta = document.getElementById('resultsMeta');
     const statsPanel = document.getElementById('statsPanel');
+    const resultsHeader = document.querySelector('.results-header');
 
     // 显示统计信息
     if (stats) {
@@ -530,6 +543,7 @@ function renderResults(papers, config, stats) {
         <strong>时间范围:</strong> ${dateRange} |
         <strong>共 ${papers.length} 篇论文</strong> |
         <strong>并发数:</strong> ${config.concurrency}
+        ${cached ? '<span class="cached-badge">📦 来自缓存</span>' : ''}
     `;
 
     // 清空容器
@@ -574,9 +588,14 @@ function renderResults(papers, config, stats) {
                 <div class="paper-meta">
                     📅 ${paper.published} | 🏷️ ${paper.primaryCategory}
                 </div>
-                <a href="${paper.pdfLink || paper.link}" target="_blank" rel="noopener" class="paper-link">
-                    📄 查看原文
-                </a>
+                <div class="paper-actions">
+                    <button class="btn-intensive-read" onclick="doIntensiveRead(${index})" title="论文精读">
+                        📖 精读
+                    </button>
+                    <a href="${paper.pdfLink || paper.link}" target="_blank" rel="noopener" class="paper-link">
+                        📄 查看原文
+                    </a>
+                </div>
             </div>
         `;
 
@@ -680,4 +699,500 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+// ==================== 论文精读功能 ====================
+
+let currentIntensiveReadPaper = null;
+
+function doIntensiveRead(index) {
+    const paper = currentPapers[index];
+    if (!paper) return;
+
+    currentIntensiveReadPaper = paper;
+
+    // 更新标题
+    document.getElementById('modalTitle').textContent = `📖 精读: ${paper.title.substring(0, 50)}${paper.title.length > 50 ? '...' : ''}`;
+
+    // 显示弹窗
+    showIntensiveReadModal();
+
+    // 调用后端API进行精读
+    intensiveReadPaper(paper);
+}
+
+function showIntensiveReadModal() {
+    const modal = document.getElementById('intensiveReadModal');
+    const loading = document.getElementById('modalLoading');
+    const content = document.getElementById('modalContent');
+    const error = document.getElementById('modalError');
+    const processing = document.getElementById('modalProcessing');
+
+    modal.classList.remove('hidden');
+    loading.classList.remove('hidden');
+    content.classList.add('hidden');
+    error.classList.add('hidden');
+    if (processing) processing.classList.remove('hidden');
+
+    // 禁止背景滚动
+    document.body.style.overflow = 'hidden';
+}
+
+function closeIntensiveReadModal() {
+    const modal = document.getElementById('intensiveReadModal');
+    const processing = document.getElementById('modalProcessing');
+
+    modal.classList.add('hidden');
+    if (processing) processing.classList.add('hidden');
+
+    // 恢复背景滚动
+    document.body.style.overflow = '';
+
+    currentIntensiveReadPaper = null;
+}
+
+async function intensiveReadPaper(paper) {
+    const config = getLLMConfig();
+
+    if (!config.endpoint || !config.model) {
+        showIntensiveReadError('请先配置 LLM API');
+        return;
+    }
+
+    // 显示进度提示
+    updateLoadingProgress('正在连接 LLM API...');
+
+    // 创建 AbortController 用于超时控制
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 600000); // 10分钟超时
+
+    try {
+        const response = await fetch(`${API_BASE}/api/intensive_read`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                paper: paper,
+                llm: config
+            }),
+            signal: controller.signal
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+            const errorData = await response.json();
+            throw new Error(errorData.error || '精读请求失败');
+        }
+
+        const data = await response.json();
+
+        if (!data.success) {
+            throw new Error(data.error || '精读分析失败');
+        }
+
+        // 渲染精读结果
+        renderIntensiveReadResult(data.result, paper);
+
+    } catch (error) {
+        clearTimeout(timeoutId);
+        if (error.name === 'AbortError') {
+            showIntensiveReadError('请求超时（超过10分钟），请稍后重试或尝试更短的摘要');
+        } else {
+            showIntensiveReadError(error.message);
+        }
+    }
+}
+
+function updateLoadingProgress(message) {
+    const loading = document.getElementById('modalLoading');
+    const p = loading.querySelector('p');
+    if (p) {
+        p.textContent = message;
+    }
+}
+
+function showIntensiveReadError(message) {
+    const loading = document.getElementById('modalLoading');
+    const error = document.getElementById('modalError');
+    const content = document.getElementById('modalContent');
+    const processing = document.getElementById('modalProcessing');
+
+    loading.classList.add('hidden');
+    if (processing) processing.classList.add('hidden');
+    content.classList.add('hidden');
+    error.classList.remove('hidden');
+    error.textContent = `❌ ${message}`;
+}
+
+function renderIntensiveReadResult(result, paper) {
+    const loading = document.getElementById('modalLoading');
+    const content = document.getElementById('modalContent');
+    const processing = document.getElementById('modalProcessing');
+
+    loading.classList.add('hidden');
+    if (processing) processing.classList.add('hidden');
+    content.classList.remove('hidden');
+
+    // 解析并渲染Markdown格式的精读内容
+    content.innerHTML = parseIntensiveReadMarkdown(result.content);
+
+    // 渲染数学公式
+    renderMathInElement(content);
+
+    // 保存原始内容用于导出
+    content.dataset.rawContent = result.content;
+}
+
+function parseIntensiveReadMarkdown(text) {
+    if (!text) return '<p>暂无内容</p>';
+
+    let html = text;
+
+    // 处理标题 (## 大标题, ### 小标题)
+    html = html.replace(/^### (.+)$/gm, '<h4>$1</h4>');
+    html = html.replace(/^## (.+)$/gm, '<h4>$1</h4>');
+
+    // 处理列表项
+    html = html.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
+    html = html.replace(/^[-*] (.+)$/gm, '<li>$1</li>');
+
+    // 将连续的<li>包裹在<ol>或<ul>中
+    html = html.replace(/(<li>[\s\S]*?<\/li>)+/g, '<ul>$&</ul>');
+
+    // 处理加粗 **text**
+    html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+
+    // 处理行内代码 `code`
+    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+    // 处理段落 - 分离非HTML标签的行
+    html = html.split('\n\n').map(para => {
+        para = para.trim();
+        if (!para) return '';
+        // 如果已经是HTML标签或包含<li>，直接返回
+        if (para.startsWith('<') || para.startsWith('##') || para.startsWith('###')) {
+            return para;
+        }
+        return `<p>${para}</p>`;
+    }).join('');
+
+    // 清理多余的空段落
+    html = html.replace(/<p>\s*<\/p>/g, '');
+
+    return html;
+}
+
+function exportIntensiveRead() {
+    const content = document.getElementById('modalContent');
+    const rawContent = content.dataset.rawContent;
+
+    if (!rawContent || !currentIntensiveReadPaper) return;
+
+    const paper = currentIntensiveReadPaper;
+    const date = new Date().toLocaleDateString('zh-CN');
+
+    let markdown = `# 📖 论文精读报告\n\n`;
+    markdown += `**论文标题:** ${paper.title}\n`;
+    markdown += `**作者:** ${paper.authors.join(', ')}\n`;
+    markdown += `**发布日期:** ${paper.published}\n`;
+    markdown += `**arXiv ID:** ${paper.id}\n`;
+    markdown += `**生成日期:** ${date}\n\n`;
+    markdown += `---\n\n`;
+    markdown += rawContent;
+    markdown += `\n\n---\n\n`;
+    markdown += `*Generated by [PaperExpress](https://github.com)*\n`;
+
+    // 下载文件
+    const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `精读_${paper.title.substring(0, 30).replace(/[\/\\:*?"<>|]/g, '_')}_${date.replace(/\//g, '-')}.md`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
+
+// 点击遮罩关闭弹窗
+document.addEventListener('click', (e) => {
+    const modal = document.getElementById('intensiveReadModal');
+    if (e.target === modal) {
+        closeIntensiveReadModal();
+    }
+});
+
+// ESC键关闭弹窗
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+        closeIntensiveReadModal();
+        closeHistoryModal();
+    }
+});
+
+// 点击遮罩关闭历史弹窗
+document.addEventListener('click', (e) => {
+    const historyModal = document.getElementById('historyModal');
+    if (e.target === historyModal) {
+        closeHistoryModal();
+    }
+});
+
+// ==================== 历史记录功能 ====================
+
+async function openHistoryModal() {
+    const modal = document.getElementById('historyModal');
+    const loading = document.getElementById('historyLoading');
+    const content = document.getElementById('historyContent');
+
+    modal.classList.remove('hidden');
+    loading.classList.remove('hidden');
+    content.classList.add('hidden');
+    document.body.style.overflow = 'hidden';
+
+    try {
+        const response = await fetch(`${API_BASE}/api/history/list`);
+        const data = await response.json();
+
+        loading.classList.add('hidden');
+        content.classList.remove('hidden');
+
+        if (data.success) {
+            renderHistoryContent(content, data);
+        } else {
+            content.innerHTML = `<div class="modal-error">加载失败: ${data.error}</div>`;
+        }
+    } catch (error) {
+        loading.classList.add('hidden');
+        content.classList.remove('hidden');
+        content.innerHTML = `<div class="modal-error">❌ 加载历史记录失败: ${error.message}</div>`;
+    }
+}
+
+function closeHistoryModal() {
+    const modal = document.getElementById('historyModal');
+    modal.classList.add('hidden');
+    document.body.style.overflow = '';
+}
+
+function renderHistoryContent(container, data) {
+    const papers = data.papers || {};
+    const intensive = data.intensive || {};
+
+    const papersKeys = Object.keys(papers);
+    const intensiveKeys = Object.keys(intensive);
+
+    if (papersKeys.length === 0 && intensiveKeys.length === 0) {
+        container.innerHTML = `
+            <div class="history-empty">
+                <p>暂无历史记录</p>
+                <p class="history-empty-hint">执行论文速递或精读后，结果将自动保存</p>
+            </div>
+        `;
+        return;
+    }
+
+    let html = '<div class="history-section">';
+
+    // 论文速递记录
+    if (papersKeys.length > 0) {
+        html += '<h4>📰 论文速递记录</h4>';
+        html += '<div class="history-list">';
+
+        // 按时间倒序排列
+        papersKeys.sort((a, b) => {
+            const dateA = papers[a].created || '';
+            const dateB = papers[b].created || '';
+            return dateB.localeCompare(dateA);
+        });
+
+        papersKeys.forEach(key => {
+            const record = papers[key];
+            const date = new Date(record.created).toLocaleString('zh-CN');
+            const count = record.count || 0;
+            html += `
+                <div class="history-item">
+                    <div class="history-item-info">
+                        <div class="history-item-title">${escapeHtml(record.title || '未命名')}</div>
+                        <div class="history-item-meta">${date} · ${count} 篇论文</div>
+                    </div>
+                    <div class="history-item-actions">
+                        <button class="btn btn-small" onclick="loadPapersHistory('${key}')">加载</button>
+                        <button class="btn btn-secondary btn-small" onclick="deletePapersHistory('${key}')">删除</button>
+                    </div>
+                </div>
+            `;
+        });
+
+        html += '</div>';
+    }
+
+    // 精读记录
+    if (intensiveKeys.length > 0) {
+        html += '<h4>📖 精读记录</h4>';
+        html += '<div class="history-list">';
+
+        // 按时间倒序排列
+        intensiveKeys.sort((a, b) => {
+            const dateA = intensive[a].created || '';
+            const dateB = intensive[b].created || '';
+            return dateB.localeCompare(dateA);
+        });
+
+        intensiveKeys.forEach(key => {
+            const record = intensive[key];
+            const date = new Date(record.created).toLocaleString('zh-CN');
+            html += `
+                <div class="history-item">
+                    <div class="history-item-info">
+                        <div class="history-item-title">${escapeHtml(record.paperTitle || '未命名')}</div>
+                        <div class="history-item-meta">${date}</div>
+                    </div>
+                    <div class="history-item-actions">
+                        <button class="btn btn-small" onclick="loadIntensiveHistory('${key}')">查看</button>
+                        <button class="btn btn-secondary btn-small" onclick="deleteIntensiveHistory('${key}')">删除</button>
+                    </div>
+                </div>
+            `;
+        });
+
+        html += '</div>';
+    }
+
+    html += '</div>';
+    container.innerHTML = html;
+}
+
+async function loadPapersHistory(hash) {
+    try {
+        const response = await fetch(`${API_BASE}/api/history/papers/${hash}`);
+        const data = await response.json();
+
+        if (!data.success || !data.record) {
+            alert('加载失败: ' + (data.error || '记录不存在'));
+            return;
+        }
+
+        const record = data.record;
+
+        // 恢复论文列表
+        const papers = record.papers || [];
+        const results = record.results || [];
+
+        const translatedPapers = papers.map((paper, i) => {
+            const result = results[i] || { result: {} };
+            const hasError = !result.success;
+            return {
+                ...paper,
+                chineseAbstract: result.result.chineseAbstract || '解析失败',
+                highlight: result.result.highlight || '解析失败',
+                translationError: hasError,
+                tokenUsage: {
+                    promptTokens: result.result.promptTokens || 0,
+                    completionTokens: result.result.completionTokens || 0,
+                    totalTokens: result.result.totalTokens || 0
+                }
+            };
+        });
+
+        // 恢复配置
+        const config = {
+            categories: record.categories || [],
+            timeRange: record.timeRange || 3,
+            maxPapers: record.maxPapers || 20,
+            concurrency: 3,
+            llm: { model: record.model || '' }
+        };
+
+        // 恢复选中分类
+        selectedCategories = new Set(record.categories || []);
+
+        currentPapers = translatedPapers;
+        translationStats = record.stats || {};
+
+        closeHistoryModal();
+        renderResults(currentPapers, config, translationStats, true);
+        showSection('results');
+
+    } catch (error) {
+        alert('加载失败: ' + error.message);
+    }
+}
+
+async function deletePapersHistory(hash) {
+    if (!confirm('确定要删除这条论文速递记录吗？')) return;
+
+    try {
+        const response = await fetch(`${API_BASE}/api/history/papers/${hash}`, {
+            method: 'DELETE'
+        });
+        const data = await response.json();
+
+        if (data.success) {
+            openHistoryModal(); // 刷新列表
+        } else {
+            alert('删除失败: ' + data.error);
+        }
+    } catch (error) {
+        alert('删除失败: ' + error.message);
+    }
+}
+
+async function loadIntensiveHistory(hash) {
+    try {
+        const response = await fetch(`${API_BASE}/api/history/intensive/${hash}`);
+        const data = await response.json();
+
+        if (!data.success || !data.record) {
+            alert('加载失败: ' + (data.error || '记录不存在'));
+            return;
+        }
+
+        const record = data.record;
+
+        // 直接显示精读结果
+        currentIntensiveReadPaper = record.paper;
+
+        document.getElementById('modalTitle').textContent = `📖 精读: ${(record.paperTitle || '').substring(0, 50)}...`;
+
+        closeHistoryModal();
+        showIntensiveReadModal();
+
+        const loading = document.getElementById('modalLoading');
+        const content = document.getElementById('modalContent');
+        loading.classList.add('hidden');
+        content.classList.remove('hidden');
+
+        content.innerHTML = parseIntensiveReadMarkdown(record.result?.content || '暂无内容');
+        renderMathInElement(content);
+        content.dataset.rawContent = record.result?.content || '';
+
+        // 显示缓存标签
+        const processing = document.getElementById('modalProcessing');
+        if (processing) processing.classList.add('hidden');
+
+    } catch (error) {
+        alert('加载失败: ' + error.message);
+    }
+}
+
+async function deleteIntensiveHistory(hash) {
+    if (!confirm('确定要删除这条精读记录吗？')) return;
+
+    try {
+        const response = await fetch(`${API_BASE}/api/history/intensive/${hash}`, {
+            method: 'DELETE'
+        });
+        const data = await response.json();
+
+        if (data.success) {
+            openHistoryModal(); // 刷新列表
+        } else {
+            alert('删除失败: ' + data.error);
+        }
+    } catch (error) {
+        alert('删除失败: ' + error.message);
+    }
 }
