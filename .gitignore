@@ -14,4 +14,6 @@ chat_history_*.txt
 *.log
 
 # 历史记录数据（本地存储，请勿上传）
-data/
+data/*
+# 但保留目录说明
+!data/README.md
