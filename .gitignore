@@ -4,6 +4,8 @@ config.json
 # Claude 相关
 .claude/
 
+.vscode/
+
 # 聊天记录
 chat_history_*.txt
 
