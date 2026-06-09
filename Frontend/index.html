@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PaperExpress - 智能化论文速递</title>
-    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="styles.css?v=20260609-trend-llm-v2">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
 </head>
 <body>
@@ -39,6 +39,15 @@
                 <div class="selected-categories" id="selectedCategories">
                     <span class="empty">未选择分类，点击上方按钮加载</span>
                 </div>
+            </div>
+
+            <div class="form-group">
+                <label for="keywordSearch">
+                    关键词搜索
+                    <span class="hint">可选，支持英文关键词或引号短语</span>
+                </label>
+                <input type="text" id="keywordSearch" placeholder='例如：LLM serving, "KV cache", diffusion policy'>
+                <div class="hint-text">可与学科分类组合使用；不选择分类时，将按关键词在 arXiv 全字段中搜索。</div>
             </div>
 
             <div class="form-row">
@@ -146,12 +155,38 @@
                     </div>
                 </div>
             </div>
+            <div class="trend-panel" id="trendPanel" style="display: none;">
+                <div class="trend-header">
+                    <div>
+                        <h3>📈 趋势速览</h3>
+                        <p id="trendScope">基于当前结果集统计</p>
+                    </div>
+                </div>
+                <div class="trend-grid">
+                    <div class="trend-card">
+                        <h4>Topic</h4>
+                        <div class="trend-list" id="trendTopics"></div>
+                    </div>
+                    <div class="trend-card">
+                        <h4>方法词</h4>
+                        <div class="trend-list" id="trendMethods"></div>
+                    </div>
+                    <div class="trend-card">
+                        <h4>分类分布</h4>
+                        <div class="trend-list" id="trendCategories"></div>
+                    </div>
+                    <div class="trend-card">
+                        <h4>发布日期</h4>
+                        <div class="trend-list" id="trendDates"></div>
+                    </div>
+                </div>
+            </div>
             <div class="papers-container" id="papersContainer"></div>
         </section>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
-    <script src="app.js"></script>
+    <script src="app.js?v=20260609-trend-llm-v2"></script>
 
     <!-- 精读弹窗 -->
     <div id="intensiveReadModal" class="modal-overlay hidden">

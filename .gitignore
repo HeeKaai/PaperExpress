@@ -6,6 +6,10 @@ config.json
 
 .vscode/
 
+.codex/
+
+__pycache__/
+
 # 聊天记录
 chat_history_*.txt
 

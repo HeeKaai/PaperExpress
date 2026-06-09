@@ -19,6 +19,25 @@ import threading
 import queue
 import time
 import hashlib
+import ast
+
+# 缓存和提示词版本，用于避免不同提示词/数据结构之间误命中
+CACHE_SCHEMA_VERSION = 2
+TRANSLATION_PROMPT_VERSION = "translation-json-v1"
+STATIC_ASSET_VERSION = "20260609-trend-llm-v2"
+
+BANNED_TREND_LABELS = {
+    "a", "an", "the", "and", "or", "of", "to", "in", "on", "for", "with", "by",
+    "from", "as", "at", "is", "are", "was", "were", "be", "been", "being",
+    "can", "could", "may", "might", "will", "would", "should", "must", "not",
+    "no", "this", "that", "these", "those", "their", "its", "our", "your",
+    "paper", "papers", "study", "studies", "work", "works", "approach",
+    "approaches", "method", "methods", "model", "models", "data", "dataset",
+    "datasets", "learning", "training", "testing", "evaluation", "benchmark",
+    "benchmarks", "result", "results", "performance", "analysis", "existing",
+    "present", "proposed", "novel", "new", "effective", "efficient", "robust",
+    "execution", "access", "control", "design", "system", "systems"
+}
 
 # 项目数据目录
 DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
@@ -53,16 +72,54 @@ def save_index(index):
         json.dump(index, f, ensure_ascii=False, indent=2)
 
 
+def safe_print(text):
+    """兼容 Windows GBK 控制台，避免启动横幅中的 emoji 导致服务退出"""
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        encoding = sys.stdout.encoding or 'utf-8'
+        safe_text = str(text).encode(encoding, errors='replace').decode(encoding, errors='replace')
+        print(safe_text)
+
+
 def compute_hash(*parts):
     """计算配置的哈希值（用于缓存键）"""
     combined = '|'.join(str(p) for p in parts)
     return hashlib.md5(combined.encode('utf-8')).hexdigest()[:16]
 
 
-def paper_config_hash(categories, time_range, max_papers):
+def normalize_keywords(keywords):
+    """规范化自由关键词，确保缓存键和查询条件稳定"""
+    if isinstance(keywords, list):
+        keywords = ' '.join(str(item) for item in keywords)
+    keywords = str(keywords or '').strip()
+    return re.sub(r'\s+', ' ', keywords)
+
+
+def current_utc_date_bucket():
+    """按 UTC 日期分桶，避免“最近 N 天”跨天仍命中过期缓存"""
+    return datetime.utcnow().strftime('%Y-%m-%d')
+
+
+def paper_config_hash(categories, time_range, max_papers, keywords='', model_name='',
+                      prompt_version=TRANSLATION_PROMPT_VERSION, paper_ids=None,
+                      date_bucket=None):
     """论文速递配置的哈希值"""
     cats = ','.join(sorted(categories))
-    return compute_hash(cats, time_range, max_papers)
+    normalized_keywords = normalize_keywords(keywords)
+    ids = ','.join(sorted(paper_ids or []))
+    bucket = date_bucket or current_utc_date_bucket()
+    return compute_hash(
+        CACHE_SCHEMA_VERSION,
+        cats,
+        normalized_keywords,
+        time_range,
+        max_papers,
+        model_name,
+        prompt_version,
+        bucket,
+        ids
+    )
 
 
 def intensive_hash(arXiv_id, paper_title):
@@ -89,12 +146,17 @@ def save_papers_record(hash_key, record):
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(record, f, ensure_ascii=False, indent=2)
 
+    paper_count = record.get('count')
+    if paper_count is None:
+        paper_count = len(record.get('papers', []))
+
     # 更新索引
     index = load_index()
     index['papers'][hash_key] = {
         "title": record.get('title', '未命名'),
         "created": record.get('created', datetime.now().isoformat()),
-        "count": record.get('count', 0)
+        "count": paper_count,
+        "keywords": record.get('keywords', '')
     }
     save_index(index)
 
@@ -221,20 +283,269 @@ ARXIV_CATEGORIES = {
 }
 
 
-def fetch_arxiv_papers(categories, time_range, max_papers=20):
+def parse_keyword_terms(keywords):
+    """解析自由关键词，支持普通空格分词和英文引号短语"""
+    normalized = normalize_keywords(keywords)
+    if not normalized:
+        return []
+
+    terms = []
+    for quoted, token in re.findall(r'"([^"]+)"|([^\s,;]+)', normalized):
+        term = (quoted or token).strip()
+        # 只把用户输入当作普通关键词，不开放 arXiv 字段语法注入。
+        term = re.sub(r'["():\[\]{}]', ' ', term)
+        term = re.sub(r'\s+', ' ', term).strip()
+        if term:
+            terms.append(term)
+    return terms
+
+
+def build_arxiv_search_query(categories, keywords=''):
+    """构建 arXiv 查询表达式：分类和关键词之间为 AND，关键词之间为 AND"""
+    clauses = []
+
+    if categories:
+        category_query = ' OR '.join([f"cat:{cat}" for cat in categories])
+        clauses.append(f"({category_query})")
+
+    keyword_terms = parse_keyword_terms(keywords)
+    if keyword_terms:
+        keyword_clauses = []
+        for term in keyword_terms:
+            if re.search(r'\s|[^A-Za-z0-9_]', term):
+                keyword_clauses.append(f'all:"{term}"')
+            else:
+                keyword_clauses.append(f'all:{term}')
+        clauses.append('(' + ' AND '.join(keyword_clauses) + ')')
+
+    if not clauses:
+        raise Exception("请至少选择一个 arXiv 分类或输入关键词")
+
+    return ' AND '.join(clauses)
+
+
+def extract_json_object(content):
+    """从模型输出中提取 JSON 对象，兼容被 Markdown 代码块包裹的情况"""
+    text = (content or '').strip()
+    if text.startswith('```'):
+        text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\s*```$', '', text)
+
+    start = text.find('{')
+    end = text.rfind('}')
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    try:
+        return json.loads(text[start:end + 1])
+    except Exception:
+        return None
+
+
+def strip_reasoning_blocks(text):
+    """移除部分推理模型可能返回的思考段落"""
+    text = str(text or '').strip()
+    text = re.sub(r'<think>[\s\S]*?</think>', '', text, flags=re.IGNORECASE).strip()
+    return text
+
+
+def iter_json_like_blocks(text):
+    """按优先级枚举可能包含 JSON 的片段"""
+    text = strip_reasoning_blocks(text)
+    if not text:
+        return
+
+    for match in re.finditer(r'```(?:json|JSON)?\s*([\s\S]*?)```', text):
+        block = match.group(1).strip()
+        if block:
+            yield block
+
+    yield text
+
+    for opener, closer in [('{', '}'), ('[', ']')]:
+        start = text.find(opener)
+        while start != -1:
+            depth = 0
+            in_string = False
+            escaped = False
+            quote_char = ''
+            for idx in range(start, len(text)):
+                ch = text[idx]
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif ch == '\\':
+                        escaped = True
+                    elif ch == quote_char:
+                        in_string = False
+                    continue
+
+                if ch in ('"', "'"):
+                    in_string = True
+                    quote_char = ch
+                elif ch == opener:
+                    depth += 1
+                elif ch == closer:
+                    depth -= 1
+                    if depth == 0:
+                        yield text[start:idx + 1].strip()
+                        break
+
+            start = text.find(opener, start + 1)
+
+
+def clean_json_like_text(text):
+    """修复常见 LLM JSON 输出小毛刺"""
+    cleaned = str(text or '').strip().lstrip('\ufeff')
+    cleaned = cleaned.replace('“', '"').replace('”', '"').replace('‘', "'").replace('’', "'")
+    cleaned = re.sub(r',\s*([}\]])', r'\1', cleaned)
+    cleaned = re.sub(r'\bNone\b', 'null', cleaned)
+    cleaned = re.sub(r'\bTrue\b', 'true', cleaned)
+    cleaned = re.sub(r'\bFalse\b', 'false', cleaned)
+    return cleaned
+
+
+def parse_json_like(content):
+    """解析严格 JSON、代码块 JSON、单引号 dict、尾逗号 JSON 等常见 LLM 输出"""
+    for block in iter_json_like_blocks(content):
+        cleaned = clean_json_like_text(block)
+        if not cleaned:
+            continue
+
+        try:
+            return json.loads(cleaned)
+        except Exception:
+            pass
+
+        try:
+            parsed = ast.literal_eval(cleaned)
+            if isinstance(parsed, (dict, list)):
+                return parsed
+        except Exception:
+            pass
+
+    return None
+
+
+def collect_text_from_value(value):
+    """从 OpenAI 兼容或类 Responses API 字段中递归提取文本"""
+    parts = []
+
+    if value is None:
+        return parts
+    if isinstance(value, str):
+        if value.strip():
+            parts.append(value)
+        return parts
+    if isinstance(value, (int, float, bool)):
+        return parts
+    if isinstance(value, list):
+        for item in value:
+            parts.extend(collect_text_from_value(item))
+        return parts
+    if isinstance(value, dict):
+        for key in (
+            "content", "text", "output_text", "reasoning_content",
+            "summary", "message", "data"
+        ):
+            if key in value:
+                parts.extend(collect_text_from_value(value.get(key)))
+        return parts
+
+    return parts
+
+
+def extract_llm_response_text(data):
+    """兼容不同 OpenAI-like 响应结构，提取模型最终文本"""
+    parts = []
+
+    # OpenAI Responses API 风格
+    parts.extend(collect_text_from_value(data.get("output_text")))
+    parts.extend(collect_text_from_value(data.get("output")))
+
+    # Chat Completions 风格
+    choices = data.get("choices", [])
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            parts.extend(collect_text_from_value(choice.get("message")))
+            parts.extend(collect_text_from_value(choice.get("delta")))
+            parts.extend(collect_text_from_value(choice.get("text")))
+
+    text = "\n".join(part.strip() for part in parts if str(part).strip()).strip()
+    return text
+
+
+def describe_llm_response_shape(data):
+    """输出安全的响应结构诊断，不打印 API Key 或完整模型内容"""
+    if not isinstance(data, dict):
+        return f"response_type={type(data).__name__}"
+
+    diagnostics = [f"top_keys={list(data.keys())[:12]}"]
+    choices = data.get("choices")
+    if isinstance(choices, list):
+        diagnostics.append(f"choices_len={len(choices)}")
+        if choices and isinstance(choices[0], dict):
+            first = choices[0]
+            diagnostics.append(f"choice0_keys={list(first.keys())[:12]}")
+            if "finish_reason" in first:
+                diagnostics.append(f"finish_reason={first.get('finish_reason')}")
+            message = first.get("message")
+            if isinstance(message, dict):
+                diagnostics.append(f"message_keys={list(message.keys())[:12]}")
+                content = message.get("content")
+                diagnostics.append(f"content_type={type(content).__name__}")
+                if isinstance(content, str):
+                    diagnostics.append(f"content_len={len(content)}")
+                reasoning = message.get("reasoning_content")
+                if isinstance(reasoning, str):
+                    diagnostics.append(f"reasoning_len={len(reasoning)}")
+
+    output = data.get("output")
+    if isinstance(output, list):
+        diagnostics.append(f"output_len={len(output)}")
+
+    return "; ".join(diagnostics)
+
+
+def parse_translation_content(content):
+    """优先解析结构化 JSON，失败时回退到旧格式正则，保证兼容已有模型输出"""
+    parsed = parse_json_like(content)
+    if isinstance(parsed, dict):
+        chinese_abstract = str(parsed.get('chineseAbstract') or parsed.get('中文摘要') or '').strip()
+        highlight = str(parsed.get('highlight') or parsed.get('亮点') or '').strip()
+        if chinese_abstract or highlight:
+            return {
+                "chineseAbstract": chinese_abstract or "解析失败",
+                "highlight": highlight.replace('\n', ' ') or "解析失败",
+                "parseMode": "json"
+            }
+
+    chinese_abstract_match = re.search(r'中文摘要[:：]\s*([\s\S]*?)(?=\n\s*亮点[:：]|$)', content, re.IGNORECASE)
+    highlight_match = re.search(r'亮点[:：]\s*(.+)', content, re.IGNORECASE | re.DOTALL)
+
+    return {
+        "chineseAbstract": chinese_abstract_match.group(1).strip() if chinese_abstract_match else "解析失败",
+        "highlight": highlight_match.group(1).strip().replace('\n', ' ') if highlight_match else "解析失败",
+        "parseMode": "legacy"
+    }
+
+
+def fetch_arxiv_papers(categories, time_range, max_papers=20, keywords=''):
     """从 arXiv 获取论文，带重试机制"""
 
     # 构建查询
-    cat_query = "+OR+".join([f"cat:{cat}" for cat in categories])
+    search_query = build_arxiv_search_query(categories, keywords)
     query_params = {
-        "search_query": cat_query,
+        "search_query": search_query,
         "sortBy": "submittedDate",
         "sortOrder": "descending",
         "start": "0",
         "max_results": str(max_papers)
     }
 
-    query_string = "&".join([f"{k}={v}" for k, v in query_params.items()])
+    query_string = parse.urlencode(query_params)
     # 使用 HTTPS 更稳定
     url = f"https://export.arxiv.org/api/query?{query_string}"
 
@@ -280,7 +591,7 @@ def fetch_arxiv_papers(categories, time_range, max_papers=20):
 
     # 计算时间阈值 (使用 UTC 时间保持一致)
     cutoff_date = datetime.utcnow() - timedelta(days=time_range)
-    print(f"[fetch] 获取论文，时间范围: {time_range}天，阈值: {cutoff_date} UTC")
+    print(f"[fetch] 获取论文，时间范围: {time_range}天，关键词: {normalize_keywords(keywords) or '无'}，阈值: {cutoff_date} UTC")
 
     papers = []
     for entry in entries:
@@ -359,9 +670,11 @@ def translate_paper(paper, llm_config):
 
 摘要：{paper['abstract']}
 
-请按以下格式返回：
-中文摘要：[翻译后的中文摘要]
-亮点：[一句话亮点]
+请严格只返回一个 JSON 对象，不要包含 Markdown 代码块或额外解释。格式如下：
+{{
+  "chineseAbstract": "翻译后的中文摘要",
+  "highlight": "一句话亮点"
+}}
 
 注意：中文摘要应准确传达原文含义，语言流畅自然。亮点应简洁有力，突出论文的核心创新或价值。"""
 
@@ -424,19 +737,338 @@ def translate_paper(paper, llm_config):
     completion_tokens = usage.get("completion_tokens", 0)
     total_tokens = usage.get("total_tokens", 0)
 
-    # 解析结果
-    chinese_abstract_match = re.search(r'中文摘要[:：]\s*([\s\S]*?)(?=\n\s*亮点[:：]|$)', content, re.IGNORECASE)
-    highlight_match = re.search(r'亮点[:：]\s*(.+)', content, re.IGNORECASE | re.DOTALL)
+    # 解析结果：优先 JSON，兼容旧格式
+    parsed_content = parse_translation_content(content)
 
     result = {
-        "chineseAbstract": chinese_abstract_match.group(1).strip() if chinese_abstract_match else "解析失败",
-        "highlight": highlight_match.group(1).strip().replace('\n', ' ') if highlight_match else "解析失败",
+        "chineseAbstract": parsed_content["chineseAbstract"],
+        "highlight": parsed_content["highlight"],
+        "parseMode": parsed_content["parseMode"],
         "promptTokens": prompt_tokens,
         "completionTokens": completion_tokens,
         "totalTokens": total_tokens
     }
     print(f"[translate] 完成: {paper['title'][:30]}... tokens: {total_tokens}")
     return result
+
+
+def truncate_text(text, max_length):
+    """限制传入 LLM 的单字段长度，避免趋势摘要请求过大"""
+    text = str(text or '').replace('\n', ' ').strip()
+    if len(text) <= max_length:
+        return text
+    return text[:max_length].rstrip() + '...'
+
+
+def normalize_trend_items(items, total_papers):
+    """清洗 LLM 返回的趋势条目，保证前端收到稳定结构"""
+    normalized = []
+    if not isinstance(items, list):
+        return normalized
+
+    seen = set()
+    for item in items:
+        if isinstance(item, str):
+            item = {"label": item}
+        if not isinstance(item, dict):
+            continue
+
+        label = str(
+            item.get("label") or
+            item.get("name") or
+            item.get("topic") or
+            item.get("method") or
+            item.get("term") or
+            item.get("关键词") or
+            item.get("主题") or
+            item.get("方法") or
+            ""
+        ).strip()
+        if not label:
+            continue
+
+        label = re.sub(r'^\s*(?:[-*]|\d+[.)、])\s*', '', label)
+        label = re.sub(r'^(?:topic|method|主题|方法词|方法)\s*[:：-]\s*', '', label, flags=re.IGNORECASE)
+        label = re.sub(r'\s+', ' ', label)[:80]
+        label = label.strip(' "\'`，,。；;：:')
+        label_key = label.lower()
+        label_words = re.findall(r'[a-zA-Z]+', label_key)
+        if label_key in BANNED_TREND_LABELS:
+            continue
+        if len(label_words) == 1 and label_words[0] in BANNED_TREND_LABELS:
+            continue
+        if len(label_words) == 1 and len(label_words[0]) <= 3 and label != label.upper():
+            continue
+        if not re.search(r'[A-Za-z\u4e00-\u9fff]', label):
+            continue
+
+        if label_key in seen:
+            continue
+        seen.add(label_key)
+
+        try:
+            count_raw = item.get("count", item.get("paperCount", item.get("覆盖论文数", 1)))
+            count_match = re.search(r'\d+', str(count_raw))
+            count = int(count_match.group(0)) if count_match else 1
+        except Exception:
+            count = 1
+        count = max(1, min(total_papers, count))
+
+        reason = truncate_text(item.get("reason") or item.get("原因") or item.get("description") or "", 120)
+        normalized.append({
+            "label": label,
+            "count": count,
+            "reason": reason
+        })
+
+    normalized.sort(key=lambda x: (-x["count"], x["label"].lower()))
+    return normalized[:8]
+
+
+def first_present(mapping, keys):
+    """从 dict 中按多个候选键取第一个存在值，大小写不敏感"""
+    if not isinstance(mapping, dict):
+        return None
+
+    lowered = {str(k).lower(): v for k, v in mapping.items()}
+    for key in keys:
+        if key in mapping:
+            return mapping[key]
+        lower_key = str(key).lower()
+        if lower_key in lowered:
+            return lowered[lower_key]
+    return None
+
+
+def split_typed_trend_items(items):
+    """兼容 [{type: topic/method, ...}] 结构"""
+    topics = []
+    methods = []
+    if not isinstance(items, list):
+        return topics, methods
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(
+            item.get("type") or item.get("category") or item.get("kind") or
+            item.get("类别") or item.get("类型") or ""
+        ).lower()
+        if "method" in item_type or "方法" in item_type or "技术" in item_type:
+            methods.append(item)
+        elif "topic" in item_type or "主题" in item_type or "方向" in item_type:
+            topics.append(item)
+
+    return topics, methods
+
+
+def parse_markdown_trend_sections(content):
+    """当模型没有返回 JSON 时，从 Markdown/纯文本小节中尽量提取条目"""
+    topics = []
+    methods = []
+    current = None
+    text = strip_reasoning_blocks(content)
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        lower = line.lower()
+        if re.search(r'\btopics?\b|主题|研究方向|问题域', lower):
+            current = "topics"
+            continue
+        if re.search(r'\bmethods?\b|方法词|技术路线|算法|模型结构', lower):
+            current = "methods"
+            continue
+
+        item_match = re.match(r'^(?:[-*]|\d+[.)、])\s*(.+)$', line)
+        if not item_match or current not in ("topics", "methods"):
+            continue
+
+        item_text = item_match.group(1).strip()
+        label = re.split(r'\s*(?:[:：\-—]|，|。)\s*', item_text, maxsplit=1)[0].strip()
+        if not label:
+            continue
+        target = topics if current == "topics" else methods
+        target.append({"label": label, "count": 1, "reason": ""})
+
+    return {"topics": topics, "methods": methods}
+
+
+def parse_trend_summary_content(content):
+    """解析趋势摘要，兼容标准 JSON、中文键、typed items 和 Markdown 兜底"""
+    parsed = parse_json_like(content)
+
+    if isinstance(parsed, dict):
+        topics = first_present(parsed, [
+            "topics", "topic", "Topics", "Topic", "热门Topic", "主题", "研究主题", "研究方向", "趋势主题"
+        ])
+        methods = first_present(parsed, [
+            "methods", "method", "Methods", "Method", "methodWords", "方法词", "方法", "技术方法", "技术路线"
+        ])
+
+        typed_topics, typed_methods = split_typed_trend_items(
+            first_present(parsed, ["items", "trends", "results", "结果", "趋势"]) or []
+        )
+        if topics is None and typed_topics:
+            topics = typed_topics
+        if methods is None and typed_methods:
+            methods = typed_methods
+
+        return {
+            "topics": topics if isinstance(topics, list) else [],
+            "methods": methods if isinstance(methods, list) else []
+        }
+
+    if isinstance(parsed, list):
+        typed_topics, typed_methods = split_typed_trend_items(parsed)
+        if typed_topics or typed_methods:
+            return {"topics": typed_topics, "methods": typed_methods}
+        return {"topics": parsed, "methods": []}
+
+    return parse_markdown_trend_sections(content)
+
+
+def post_llm_json_request(api_url, api_key, payload, timeout=180, allow_response_format_fallback=False):
+    """发送 LLM 请求；当 response_format 不兼容时自动降级重试"""
+
+    def do_post(request_payload):
+        req = request.Request(
+            api_url,
+            data=json.dumps(request_payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "PaperExpress/1.0"
+            },
+            method="POST"
+        )
+
+        ssl_context = ssl.create_default_context()
+        with request.urlopen(req, context=ssl_context, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    try:
+        return do_post(payload)
+    except error.HTTPError as e:
+        error_body = e.read().decode("utf-8")
+        try:
+            error_json = json.loads(error_body)
+            error_msg = error_json.get("error", {}).get("message", str(e))
+        except Exception:
+            error_msg = error_body or str(e)
+
+        if allow_response_format_fallback and "response_format" in payload:
+            fallback_payload = dict(payload)
+            fallback_payload.pop("response_format", None)
+            try:
+                safe_print(f"[trend_summary] response_format 不兼容，已降级普通 JSON 提示: {truncate_text(error_msg, 120)}")
+                return do_post(fallback_payload)
+            except error.HTTPError as fallback_error:
+                fallback_body = fallback_error.read().decode("utf-8")
+                try:
+                    fallback_json = json.loads(fallback_body)
+                    fallback_msg = fallback_json.get("error", {}).get("message", str(fallback_error))
+                except Exception:
+                    fallback_msg = fallback_body or str(fallback_error)
+                raise Exception(f"LLM API 错误: {fallback_msg}")
+
+        raise Exception(f"LLM API 错误: {error_msg}")
+    except error.URLError as e:
+        raise Exception(f"连接超时，请检查网络或API地址: {str(e)}")
+
+
+def summarize_trends_with_llm(papers, llm_config):
+    """调用一次 LLM，为当前结果集生成 Topic 和方法词"""
+
+    api_url = llm_config.get("endpoint", "")
+    api_key = llm_config.get("key", "")
+    model_name = llm_config.get("model", "")
+
+    if not api_url or not model_name:
+        raise Exception("LLM API 地址和模型名称不能为空")
+
+    if not api_url.endswith('/chat/completions'):
+        api_url = api_url.rstrip('/') + '/chat/completions'
+
+    compact_papers = []
+    for idx, paper in enumerate(papers[:30], start=1):
+        compact_papers.append({
+            "index": idx,
+            "title": truncate_text(paper.get("title", ""), 160),
+            "abstract": truncate_text(paper.get("abstract", ""), 420),
+            "chineseAbstract": truncate_text(paper.get("chineseAbstract", ""), 220),
+            "highlight": truncate_text(paper.get("highlight", ""), 140),
+            "primaryCategory": paper.get("primaryCategory", ""),
+            "published": paper.get("published", "")
+        })
+
+    system_prompt = """你是一名论文情报分析师。你必须只输出一个可被 json.loads 解析的 JSON 对象。不要输出 Markdown，不要输出代码块，不要输出解释性文字。JSON 顶层只能包含 topics 和 methods 两个数组。"""
+
+    prompt = f"""请基于下面这批 arXiv 论文的标题、摘要、分类和亮点，生成当前结果集的趋势摘要。
+
+任务：
+1. 生成 topics：当前论文集中真正有研究意义的 Topic。Topic 应是研究方向、任务、应用场景或问题域，例如 "LLM serving", "robot manipulation", "retrieval-augmented generation"。不要做词频统计，不要输出 these、can、not、are、execution、present、access、control、design、existing、model、method、data、learning 等泛词或功能词。
+2. 生成 methods：当前论文集中出现的方法词、技术路线、模型结构或算法组件，例如 "KV cache", "diffusion policy", "LoRA", "graph neural network"。不要把普通形容词、动词、停用词、数据集名、评价指标或 Benchmark 当作方法。
+3. 合并同义表达，使用简洁标签；英文技术词保留英文，必要时可用中文。
+4. count 表示该条目大致覆盖了当前 {len(compact_papers)} 篇论文中的多少篇。请按 count 从高到低排序。
+5. reason 用一句中文说明该条目为何重要，必须简短。
+6. label 优先使用 2-5 个词的短语；除 RAG、LoRA、MoE、LLM 等公认缩写外，不要输出单个普通英文词。
+7. 如果没有足够证据形成高质量 Topic 或方法词，请返回空数组，不要用高频词凑数。
+
+请严格只返回 JSON，不要 Markdown，不要解释，不要使用单引号。格式：
+{{
+  "topics": [
+    {{"label": "Topic 名称", "count": 3, "reason": "简短原因"}}
+  ],
+  "methods": [
+    {{"label": "方法词名称", "count": 2, "reason": "简短原因"}}
+  ]
+}}
+
+论文列表：
+{json.dumps(compact_papers, ensure_ascii=False)}
+"""
+
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.2,
+        "max_tokens": 1600,
+        "stream": False,
+        "response_format": {"type": "json_object"}
+    }
+
+    data = post_llm_json_request(api_url, api_key, payload, timeout=180, allow_response_format_fallback=True)
+
+    usage = data.get("usage", {})
+    total_papers = max(1, len(compact_papers))
+    content = extract_llm_response_text(data)
+    if not content:
+        safe_print(f"[trend_summary] 模型响应文本为空，响应结构: {describe_llm_response_shape(data)}")
+
+    parsed = parse_trend_summary_content(content)
+    topics = normalize_trend_items(parsed.get("topics", []), total_papers)
+    methods = normalize_trend_items(parsed.get("methods", []), total_papers)
+
+    warning = ""
+    if not topics and not methods:
+        warning = "趋势摘要未提取到可展示条目"
+        preview = truncate_text(content, 300)
+        safe_print(f"[trend_summary] 未提取到趋势条目，模型输出预览: {preview}")
+
+    return {
+        "topics": topics,
+        "methods": methods,
+        "warning": warning,
+        "promptTokens": usage.get("prompt_tokens", 0),
+        "completionTokens": usage.get("completion_tokens", 0),
+        "totalTokens": usage.get("total_tokens", 0)
+    }
 
 
 def intensive_read_paper(paper, llm_config):
@@ -642,11 +1274,12 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
         """提供静态文件服务"""
         # 前端文件在 Frontend 文件夹
         base_dir = os.path.join(os.path.dirname(__file__), 'Frontend')
+        parsed_path = urlparse(path).path
 
-        if path == '/':
-            path = '/index.html'
+        if parsed_path == '/':
+            parsed_path = '/index.html'
 
-        file_path = os.path.normpath(os.path.join(base_dir, path.lstrip('/')))
+        file_path = os.path.normpath(os.path.join(base_dir, parsed_path.lstrip('/')))
 
         # 安全检查：防止路径遍历
         if not file_path.startswith(os.path.normpath(base_dir)):
@@ -671,6 +1304,10 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
         """设置响应头"""
         self.send_response(status_code)
         self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        self.send_header("X-PaperExpress-Version", STATIC_ASSET_VERSION)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "POST, GET, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
@@ -770,6 +1407,8 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
                 response = self._handle_test(data)
             elif path == "/api/intensive_read":
                 response = self._handle_intensive_read(data)
+            elif path == "/api/trend_summary":
+                response = self._handle_trend_summary(data)
             elif path == "/api/history/check":
                 response = self._handle_history_check(data)
             else:
@@ -789,8 +1428,9 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
         categories = data.get("categories", [])
         time_range = data.get("timeRange", 3)
         max_papers = data.get("maxPapers", 20)
+        keywords = normalize_keywords(data.get("keywords", ""))
 
-        papers = fetch_arxiv_papers(categories, time_range, max_papers)
+        papers = fetch_arxiv_papers(categories, time_range, max_papers, keywords)
 
         return {
             "success": True,
@@ -818,10 +1458,20 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
         categories = data.get("categories", [])
         time_range = data.get("timeRange", 3)
         max_papers = data.get("maxPapers", 20)
+        keywords = normalize_keywords(data.get("keywords", ""))
         model_name = llm_config.get("model", "")
+        paper_ids = [paper.get("id", "") for paper in papers if paper.get("id")]
 
         # 检查缓存
-        cache_hash = paper_config_hash(categories, time_range, max_papers)
+        cache_hash = paper_config_hash(
+            categories,
+            time_range,
+            max_papers,
+            keywords,
+            model_name,
+            TRANSLATION_PROMPT_VERSION,
+            paper_ids
+        )
         cached = get_papers_record(cache_hash)
         if cached:
             print(f"[batch] 命中缓存: {cache_hash}, {len(papers)} 篇论文")
@@ -910,11 +1560,21 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
 
         # 保存到缓存
         cat_names = ','.join(sorted(categories))
+        title_parts = []
+        if cat_names:
+            title_parts.append(cat_names)
+        if keywords:
+            title_parts.append(f"关键词: {keywords}")
+        title_suffix = ' / '.join(title_parts) if title_parts else '全部'
         cache_record = {
-            "title": f"论文速递: {cat_names}",
+            "schemaVersion": CACHE_SCHEMA_VERSION,
+            "promptVersion": TRANSLATION_PROMPT_VERSION,
+            "title": f"论文速递: {title_suffix}",
             "categories": categories,
+            "keywords": keywords,
             "timeRange": time_range,
             "maxPapers": max_papers,
+            "count": len(papers),
             "model": model_name,
             "papers": papers,
             "results": results,
@@ -939,6 +1599,21 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
         result = test_llm_connection(llm_config)
 
         return result
+
+    def _handle_trend_summary(self, data):
+        """处理当前结果集趋势摘要请求"""
+        papers = data.get("papers", [])
+        llm_config = data.get("llm", {})
+
+        if not papers:
+            return {"success": False, "error": "论文数据不能为空"}
+
+        result = summarize_trends_with_llm(papers, llm_config)
+
+        return {
+            "success": True,
+            "result": result
+        }
 
     def _handle_intensive_read(self, data):
         """处理论文精读请求"""
@@ -993,7 +1668,36 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
             categories = data.get("categories", [])
             time_range = data.get("timeRange", 3)
             max_papers = data.get("maxPapers", 20)
-            cache_hash = paper_config_hash(categories, time_range, max_papers)
+            keywords = normalize_keywords(data.get("keywords", ""))
+            model_name = data.get("model", "")
+            paper_ids = data.get("paperIds", [])
+
+            if not paper_ids:
+                index = load_index()
+                target_categories = sorted(categories)
+                for key in index.get("papers", {}):
+                    record = get_papers_record(key)
+                    if not record:
+                        continue
+                    same_config = (
+                        sorted(record.get("categories", [])) == target_categories and
+                        record.get("timeRange", 3) == time_range and
+                        record.get("maxPapers", 20) == max_papers and
+                        normalize_keywords(record.get("keywords", "")) == keywords and
+                        (not model_name or record.get("model", "") == model_name)
+                    )
+                    if same_config:
+                        return {
+                            "success": True,
+                            "cached": True,
+                            "hash": key,
+                            "title": record.get("title", ""),
+                            "created": record.get("created", ""),
+                            "count": record.get("count", len(record.get("papers", []))),
+                            "keywords": record.get("keywords", "")
+                        }
+
+            cache_hash = paper_config_hash(categories, time_range, max_papers, keywords, model_name, paper_ids=paper_ids)
             cached = get_papers_record(cache_hash)
             if cached:
                 return {
@@ -1002,7 +1706,8 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
                     "hash": cache_hash,
                     "title": cached.get("title", ""),
                     "created": cached.get("created", ""),
-                    "count": cached.get("count", 0)
+                    "count": cached.get("count", len(cached.get("papers", []))),
+                    "keywords": cached.get("keywords", "")
                 }
             return {"success": True, "cached": False, "hash": cache_hash}
 
@@ -1026,6 +1731,14 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
     def _handle_history_list(self):
         """获取所有历史记录列表"""
         index = load_index()
+        for key, meta in index.get("papers", {}).items():
+            record = get_papers_record(key)
+            if record:
+                paper_count = record.get("count")
+                if paper_count is None or paper_count == 0:
+                    paper_count = len(record.get("papers", []))
+                meta["count"] = paper_count
+                meta["keywords"] = record.get("keywords", meta.get("keywords", ""))
         return {
             "success": True,
             "papers": index.get("papers", {}),
@@ -1095,7 +1808,7 @@ def run_server(port=8080):
     server_address = ("", port)
     httpd = ThreadedHTTPServer(server_address, PaperExpressHandler)
 
-    print(f"""
+    safe_print(f"""
 ╔══════════════════════════════════════════════════════════╗
 ║                    PaperExpress Server                   ║
 ║                                                          ║
@@ -1108,6 +1821,7 @@ def run_server(port=8080):
 ║    - POST /api/translate      翻译单篇论文               ║
 ║    - POST /api/translate_batch 批量翻译(支持并发)        ║
 ║    - POST /api/intensive_read  论文精读分析              ║
+║    - POST /api/trend_summary   LLM 趋势摘要              ║
 ║    - POST /api/test           测试 LLM 连接              ║
 ║                                                          ║
 ║  在浏览器打开上述地址即可使用                              ║

@@ -10,6 +10,8 @@ let categoriesLoaded = false;
 let selectedCategories = new Set();
 let translateStartTime = 0;
 let translationStats = null;
+let currentRunConfig = null;
+let trendRequestSeq = 0;
 
 // API 基础 URL - 后端和前端在同一个服务器上，使用相对路径
 const API_BASE = '';
@@ -94,6 +96,9 @@ function setupEventListeners() {
 
     // 首页历史记录按钮
     document.getElementById('homeHistoryBtn').addEventListener('click', openHistoryModal);
+
+    // 关键词输入也可以独立触发搜索
+    document.getElementById('keywordSearch').addEventListener('input', updateStartButton);
 }
 
 // 加载学科分类
@@ -175,7 +180,7 @@ async function loadCategories() {
         updateStartButton();
 
     } catch (error) {
-        container.innerHTML = `<div class="loading-text" style="color: var(--error-color)">加载失败: ${error.message}</div>`;
+        container.innerHTML = `<div class="loading-text" style="color: var(--error-color)">加载失败: ${escapeHtml(error.message)}</div>`;
     } finally {
         loadBtn.disabled = false;
         loadBtn.textContent = '📋 重新加载分类';
@@ -272,9 +277,11 @@ function updateSelectedCategoriesDisplay() {
 // 更新开始按钮状态
 function updateStartButton() {
     const hasCategories = selectedCategories.size > 0;
-    startBtn.disabled = !hasCategories;
-    if (!hasCategories) {
-        startBtn.title = '请至少选择一个学科分类';
+    const hasKeywords = document.getElementById('keywordSearch').value.trim().length > 0;
+    const hasSearchCondition = hasCategories || hasKeywords;
+    startBtn.disabled = !hasSearchCondition;
+    if (!hasSearchCondition) {
+        startBtn.title = '请至少选择一个学科分类或输入关键词';
     } else {
         startBtn.title = '';
     }
@@ -363,8 +370,8 @@ async function handleStart() {
 
     const config = getConfig();
 
-    if (config.categories.length === 0) {
-        alert('请至少选择一个学科分类');
+    if (config.categories.length === 0 && !config.keywords) {
+        alert('请至少选择一个学科分类或输入关键词');
         return;
     }
 
@@ -386,6 +393,7 @@ async function handleStart() {
             },
             body: JSON.stringify({
                 categories: config.categories,
+                keywords: config.keywords,
                 timeRange: config.timeRange,
                 maxPapers: config.maxPapers
             })
@@ -418,6 +426,7 @@ async function handleStart() {
                 llm: config.llm,
                 concurrency: config.concurrency,
                 categories: config.categories,
+                keywords: config.keywords,
                 timeRange: config.timeRange,
                 maxPapers: config.maxPapers
             })
@@ -437,8 +446,11 @@ async function handleStart() {
             updateProgress(80, '加载中...', `✓ 命中历史缓存 (${cachedDate})，正在加载...`);
         }
 
-        // 合并翻译结果
-        const translatedPapers = papers.map((paper, i) => {
+        // 合并翻译结果；命中缓存时优先使用缓存中的论文列表，避免与旧请求结果错位
+        const sourcePapers = translateData.cached && Array.isArray(translateData.papers) && translateData.papers.length > 0
+            ? translateData.papers
+            : papers;
+        const translatedPapers = sourcePapers.map((paper, i) => {
             const result = results[i] || { result: {} };
             const hasError = !result.success;
             return {
@@ -474,6 +486,7 @@ async function handleStart() {
 function getConfig() {
     return {
         categories: Array.from(selectedCategories),
+        keywords: document.getElementById('keywordSearch').value.trim(),
         timeRange: parseInt(document.getElementById('timeRange').value),
         maxPapers: parseInt(document.getElementById('maxPapers').value),
         concurrency: parseInt(document.getElementById('concurrency').value),
@@ -518,6 +531,7 @@ function renderResults(papers, config, stats, cached) {
     const meta = document.getElementById('resultsMeta');
     const statsPanel = document.getElementById('statsPanel');
     const resultsHeader = document.querySelector('.results-header');
+    currentRunConfig = config;
 
     // 显示统计信息
     if (stats) {
@@ -536,15 +550,21 @@ function renderResults(papers, config, stats, cached) {
     }
 
     // 元信息
-    const categories = config.categories.slice(0, 5).join(', ') + (config.categories.length > 5 ? ` 等${config.categories.length}个分类` : '');
+    const categories = config.categories && config.categories.length > 0
+        ? config.categories.slice(0, 5).join(', ') + (config.categories.length > 5 ? ` 等${config.categories.length}个分类` : '')
+        : '未限定分类';
+    const keywords = config.keywords ? escapeHtml(config.keywords) : '';
     const dateRange = `最近 ${config.timeRange} 天`;
     meta.innerHTML = `
-        <strong>分类:</strong> ${categories} |
+        <strong>分类:</strong> ${escapeHtml(categories)} |
+        ${keywords ? `<strong>关键词:</strong> ${keywords} |` : ''}
         <strong>时间范围:</strong> ${dateRange} |
         <strong>共 ${papers.length} 篇论文</strong> |
         <strong>并发数:</strong> ${config.concurrency}
         ${cached ? '<span class="cached-badge">📦 来自缓存</span>' : ''}
     `;
+
+    renderTrendPanel(papers, config);
 
     // 清空容器
     container.innerHTML = '';
@@ -614,40 +634,245 @@ function renderMathInElement(element) {
         // 只渲染标记为 .render-math 的元素
         const mathElements = element.querySelectorAll('.render-math');
         mathElements.forEach(el => {
-            // 使用 textContent 获取原始文本，避免 HTML 实体问题
-            let text = el.textContent;
-            let hasFormula = false;
+            const text = el.textContent;
+            const tokenRegex = /\$([^$]+)\$|\*\*([^*]+)\*\*|`([^`]+)`/g;
+            const fragment = document.createDocumentFragment();
+            let lastIndex = 0;
+            let changed = false;
+            let match;
 
-            // 1. 先处理数学公式 $...$
-            const formulaRegex = /\$([^\$]+)\$/g;
-            text = text.replace(formulaRegex, (match, formula) => {
-                try {
-                    if (formula.length > 200) return match;  // 跳过过长的公式
-                    hasFormula = true;
-                    return katex.renderToString(formula, {
-                        throwOnError: false,
-                        displayMode: false
-                    });
-                } catch (e) {
-                    return match;
+            while ((match = tokenRegex.exec(text)) !== null) {
+                if (match.index > lastIndex) {
+                    fragment.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
                 }
-            });
 
-            // 2. 处理 Markdown 粗体 **...**
-            const boldRegex = /\*\*([^\*]+)\*\*/g;
-            if (boldRegex.test(text)) {
-                text = text.replace(boldRegex, '<strong>$1</strong>');
-                hasFormula = true;
+                if (match[1]) {
+                    const formula = match[1];
+                    if (formula.length <= 200) {
+                        const wrapper = document.createElement('span');
+                        try {
+                            wrapper.innerHTML = katex.renderToString(formula, {
+                                throwOnError: false,
+                                displayMode: false
+                            });
+                        } catch (e) {
+                            wrapper.textContent = match[0];
+                        }
+                        fragment.appendChild(wrapper);
+                        changed = true;
+                    } else {
+                        fragment.appendChild(document.createTextNode(match[0]));
+                    }
+                } else if (match[2]) {
+                    const strong = document.createElement('strong');
+                    strong.textContent = match[2];
+                    fragment.appendChild(strong);
+                    changed = true;
+                } else if (match[3]) {
+                    const code = document.createElement('code');
+                    code.textContent = match[3];
+                    fragment.appendChild(code);
+                    changed = true;
+                }
+
+                lastIndex = tokenRegex.lastIndex;
             }
 
-            // 只有包含公式或粗体时才更新，避免不必要的重新渲染
-            if (hasFormula) {
-                el.innerHTML = text;
+            if (changed) {
+                if (lastIndex < text.length) {
+                    fragment.appendChild(document.createTextNode(text.slice(lastIndex)));
+                }
+                el.replaceChildren(fragment);
             }
         });
     } catch (e) {
         console.warn('Rendering skipped:', e.message);
     }
+}
+
+// ==================== 当前结果趋势统计 ====================
+
+function renderTrendPanel(papers, config) {
+    const panel = document.getElementById('trendPanel');
+    if (!panel) return;
+
+    if (!papers || papers.length === 0) {
+        panel.style.display = 'none';
+        return;
+    }
+
+    panel.style.display = 'block';
+    document.getElementById('trendScope').textContent = `基于当前 ${papers.length} 篇论文统计`;
+
+    const categoryItems = getCountItems(papers.map(paper => paper.primaryCategory || '未分类'), 8);
+    const dateItems = getCountItems(papers.map(paper => paper.published || '未知日期'), 8, true);
+
+    renderTrendLoading('trendTopics', 'LLM 正在生成 Topic...');
+    renderTrendLoading('trendMethods', 'LLM 正在生成方法词...');
+    renderTrendList('trendCategories', categoryItems, papers.length, '暂无分类数据');
+    renderTrendList('trendDates', dateItems, papers.length, '暂无日期数据');
+
+    loadLlmTrendSummary(papers, config);
+}
+
+async function loadLlmTrendSummary(papers, config) {
+    const requestId = ++trendRequestSeq;
+    const llmConfig = getTrendLLMConfig(config);
+
+    if (!llmConfig.endpoint || !llmConfig.model) {
+        renderTrendNotice('trendTopics', '请先配置 LLM 后生成 Topic');
+        renderTrendNotice('trendMethods', '请先配置 LLM 后生成方法词');
+        return;
+    }
+
+    try {
+        const response = await fetch(`${API_BASE}/api/trend_summary`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                papers: papers.map(paper => ({
+                    title: paper.title,
+                    abstract: paper.abstract,
+                    highlight: paper.highlight,
+                    chineseAbstract: paper.chineseAbstract,
+                    primaryCategory: paper.primaryCategory,
+                    published: paper.published
+                })),
+                llm: llmConfig
+            })
+        });
+
+        if (requestId !== trendRequestSeq) return;
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(errorData.error || '趋势摘要请求失败');
+        }
+
+        const data = await response.json();
+        if (!data.success) {
+            throw new Error(data.error || '趋势摘要生成失败');
+        }
+
+        const result = data.result || {};
+        renderTrendList('trendTopics', result.topics || [], papers.length, '暂无明显 Topic');
+        renderTrendList('trendMethods', result.methods || [], papers.length, '暂无明显方法词');
+
+        const tokenText = result.totalTokens ? ` · 趋势摘要 ${result.totalTokens.toLocaleString()} tokens` : '';
+        const warningText = result.warning ? ` · ${result.warning}` : '';
+        document.getElementById('trendScope').textContent = `基于当前 ${papers.length} 篇论文统计${tokenText}${warningText}`;
+    } catch (error) {
+        if (requestId !== trendRequestSeq) return;
+        renderTrendNotice('trendTopics', `Topic 生成失败: ${error.message}`);
+        renderTrendNotice('trendMethods', `方法词生成失败: ${error.message}`);
+    }
+}
+
+function getTrendLLMConfig(config) {
+    const formConfig = getLLMConfig();
+    const configLlm = config.llm || {};
+    const hasFullConfig = configLlm.endpoint && configLlm.key && configLlm.model;
+    if (hasFullConfig) {
+        return configLlm;
+    }
+
+    return {
+        endpoint: formConfig.endpoint || configLlm.endpoint || '',
+        key: formConfig.key || configLlm.key || '',
+        model: formConfig.model || configLlm.model || ''
+    };
+}
+
+function getCountItems(values, limit, sortByLabel = false) {
+    const counts = new Map();
+    values.filter(Boolean).forEach(value => counts.set(value, (counts.get(value) || 0) + 1));
+    const items = Array.from(counts.entries()).map(([label, count]) => ({ label, count }));
+    if (sortByLabel) {
+        items.sort((a, b) => b.label.localeCompare(a.label));
+    } else {
+        items.sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+    }
+    return items.slice(0, limit);
+}
+
+function renderTrendLoading(containerId, text) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    container.replaceChildren();
+
+    const loading = document.createElement('div');
+    loading.className = 'trend-empty';
+    loading.textContent = text;
+    container.appendChild(loading);
+}
+
+function renderTrendNotice(containerId, text) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    container.replaceChildren();
+
+    const notice = document.createElement('div');
+    notice.className = 'trend-empty';
+    notice.textContent = text;
+    container.appendChild(notice);
+}
+
+function renderTrendList(containerId, items, total, emptyText) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    container.replaceChildren();
+    if (!items || items.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'trend-empty';
+        empty.textContent = emptyText;
+        container.appendChild(empty);
+        return;
+    }
+
+    const maxCount = Math.max(...items.map(item => item.count), 1);
+    items.forEach(item => {
+        const row = document.createElement('div');
+        row.className = 'trend-bar-row';
+
+        const top = document.createElement('div');
+        top.className = 'trend-bar-top';
+
+        const label = document.createElement('span');
+        label.className = 'trend-label';
+        label.textContent = item.label;
+
+        const count = document.createElement('span');
+        count.className = 'trend-count';
+        count.textContent = `${item.count} 篇`;
+
+        const track = document.createElement('div');
+        track.className = 'trend-bar-track';
+
+        const fill = document.createElement('div');
+        fill.className = 'trend-bar-fill';
+        fill.style.width = `${Math.max(8, Math.round((item.count / maxCount) * 100))}%`;
+
+        const ratio = document.createElement('span');
+        ratio.className = 'trend-ratio';
+        ratio.textContent = `${Math.round((item.count / total) * 100)}%`;
+
+        top.appendChild(label);
+        top.appendChild(count);
+        track.appendChild(fill);
+        row.appendChild(top);
+        row.appendChild(track);
+        row.appendChild(ratio);
+        if (item.reason) {
+            const reason = document.createElement('div');
+            reason.className = 'trend-reason';
+            reason.textContent = item.reason;
+            row.appendChild(reason);
+        }
+        container.appendChild(row);
+    });
 }
 
 // 导出为 Markdown
@@ -658,6 +883,16 @@ function exportToMarkdown() {
     let markdown = `# 📄 PaperExpress 论文速递\n\n`;
     markdown += `**生成日期:** ${date}  \n`;
     markdown += `**论文数量:** ${currentPapers.length} 篇\n\n`;
+    if (currentRunConfig) {
+        const categoryText = currentRunConfig.categories && currentRunConfig.categories.length > 0
+            ? currentRunConfig.categories.join(', ')
+            : '未限定分类';
+        markdown += `**分类:** ${categoryText}  \n`;
+        if (currentRunConfig.keywords) {
+            markdown += `**关键词:** ${currentRunConfig.keywords}  \n`;
+        }
+        markdown += `**时间范围:** 最近 ${currentRunConfig.timeRange} 天\n\n`;
+    }
     markdown += `---\n\n`;
 
     currentPapers.forEach((paper, index) => {
@@ -848,40 +1083,47 @@ function renderIntensiveReadResult(result, paper) {
 function parseIntensiveReadMarkdown(text) {
     if (!text) return '<p>暂无内容</p>';
 
-    let html = text;
+    const lines = text.replace(/\r\n/g, '\n').split('\n');
+    const html = [];
+    let listOpen = false;
 
-    // 处理标题 (## 大标题, ### 小标题)
-    html = html.replace(/^### (.+)$/gm, '<h4>$1</h4>');
-    html = html.replace(/^## (.+)$/gm, '<h4>$1</h4>');
-
-    // 处理列表项
-    html = html.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
-    html = html.replace(/^[-*] (.+)$/gm, '<li>$1</li>');
-
-    // 将连续的<li>包裹在<ol>或<ul>中
-    html = html.replace(/(<li>[\s\S]*?<\/li>)+/g, '<ul>$&</ul>');
-
-    // 处理加粗 **text**
-    html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-
-    // 处理行内代码 `code`
-    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
-
-    // 处理段落 - 分离非HTML标签的行
-    html = html.split('\n\n').map(para => {
-        para = para.trim();
-        if (!para) return '';
-        // 如果已经是HTML标签或包含<li>，直接返回
-        if (para.startsWith('<') || para.startsWith('##') || para.startsWith('###')) {
-            return para;
+    const closeList = () => {
+        if (listOpen) {
+            html.push('</ul>');
+            listOpen = false;
         }
-        return `<p>${para}</p>`;
-    }).join('');
+    };
 
-    // 清理多余的空段落
-    html = html.replace(/<p>\s*<\/p>/g, '');
+    lines.forEach(line => {
+        const trimmed = line.trim();
+        if (!trimmed) {
+            closeList();
+            return;
+        }
 
-    return html;
+        const headingMatch = trimmed.match(/^#{2,4}\s+(.+)$/);
+        if (headingMatch) {
+            closeList();
+            html.push(`<h4 class="render-math">${escapeHtml(headingMatch[1])}</h4>`);
+            return;
+        }
+
+        const listMatch = trimmed.match(/^(\d+\.|[-*])\s+(.+)$/);
+        if (listMatch) {
+            if (!listOpen) {
+                html.push('<ul>');
+                listOpen = true;
+            }
+            html.push(`<li class="render-math">${escapeHtml(listMatch[2])}</li>`);
+            return;
+        }
+
+        closeList();
+        html.push(`<p class="render-math">${escapeHtml(trimmed)}</p>`);
+    });
+
+    closeList();
+    return html.join('');
 }
 
 function exportIntensiveRead() {
@@ -962,12 +1204,12 @@ async function openHistoryModal() {
         if (data.success) {
             renderHistoryContent(content, data);
         } else {
-            content.innerHTML = `<div class="modal-error">加载失败: ${data.error}</div>`;
+            content.innerHTML = `<div class="modal-error">加载失败: ${escapeHtml(data.error || '未知错误')}</div>`;
         }
     } catch (error) {
         loading.classList.add('hidden');
         content.classList.remove('hidden');
-        content.innerHTML = `<div class="modal-error">❌ 加载历史记录失败: ${error.message}</div>`;
+        content.innerHTML = `<div class="modal-error">❌ 加载历史记录失败: ${escapeHtml(error.message)}</div>`;
     }
 }
 
@@ -1012,11 +1254,12 @@ function renderHistoryContent(container, data) {
             const record = papers[key];
             const date = new Date(record.created).toLocaleString('zh-CN');
             const count = record.count || 0;
+            const keywordMeta = record.keywords ? ` · 关键词: ${escapeHtml(record.keywords)}` : '';
             html += `
                 <div class="history-item">
                     <div class="history-item-info">
                         <div class="history-item-title">${escapeHtml(record.title || '未命名')}</div>
-                        <div class="history-item-meta">${date} · ${count} 篇论文</div>
+                        <div class="history-item-meta">${date} · ${count} 篇论文${keywordMeta}</div>
                     </div>
                     <div class="history-item-actions">
                         <button class="btn btn-small" onclick="loadPapersHistory('${key}')">加载</button>
@@ -1100,6 +1343,7 @@ async function loadPapersHistory(hash) {
         // 恢复配置
         const config = {
             categories: record.categories || [],
+            keywords: record.keywords || '',
             timeRange: record.timeRange || 3,
             maxPapers: record.maxPapers || 20,
             concurrency: 3,
@@ -1108,6 +1352,9 @@ async function loadPapersHistory(hash) {
 
         // 恢复选中分类
         selectedCategories = new Set(record.categories || []);
+        document.getElementById('keywordSearch').value = record.keywords || '';
+        updateSelectedCategoriesDisplay();
+        updateStartButton();
 
         currentPapers = translatedPapers;
         translationStats = record.stats || {};
