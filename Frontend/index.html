@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PaperExpress - 智能化论文速递</title>
-    <link rel="stylesheet" href="styles.css?v=20260609-trend-llm-v2">
+    <link rel="stylesheet" href="styles.css?v=20260625-research-agent-v1">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
 </head>
 <body>
@@ -14,10 +14,19 @@
             <p class="subtitle">智能化论文速递</p>
         </header>
 
-        <!-- 服务器状态 -->
-        <div class="server-status" id="serverStatus">
-            <span class="status-indicator checking"></span>
-            <span class="status-text">正在检查服务器连接...</span>
+        <div class="top-bar">
+            <!-- 服务器状态 -->
+            <div class="server-status" id="serverStatus">
+                <span class="status-indicator checking"></span>
+                <span class="status-text">正在检查服务器连接...</span>
+            </div>
+            <button type="button" class="feature-entry-btn" id="openAgentPageBtn">
+                <span class="feature-entry-icon">🧭</span>
+                <span>
+                    <strong>研究 Agent</strong>
+                    <small>复杂问题多步检索与综述</small>
+                </span>
+            </button>
         </div>
 
         <!-- 配置区 -->
@@ -112,6 +121,75 @@
             </button>
         </section>
 
+        <!-- Agent 独立工作区 -->
+        <section class="agent-workspace-section hidden" id="agentWorkspaceSection">
+            <div class="agent-page-header">
+                <button type="button" class="btn btn-secondary btn-small" id="agentWorkspaceBackBtn">← 返回论文速递</button>
+                <div>
+                    <h2>🧭 研究 Agent</h2>
+                    <p>输入一个开放式研究问题，系统会自动理解意图、拆分多角度英文检索式、优先检索 arXiv，并把结果提炼成中文综述。</p>
+                </div>
+            </div>
+
+            <div class="agent-intro-grid">
+                <div class="agent-intro-item">
+                    <strong>查询理解</strong>
+                    <span>识别研究对象、任务域、同义词和范围边界</span>
+                </div>
+                <div class="agent-intro-item">
+                    <strong>多步检索</strong>
+                    <span>自动生成扩展、细化、方法和评测角度的子查询</span>
+                </div>
+                <div class="agent-intro-item">
+                    <strong>知识提炼</strong>
+                    <span>基于命中论文总结趋势、方法路线、证据与局限</span>
+                </div>
+            </div>
+
+            <div class="agent-run-panel">
+                <label for="agentQuestion">研究问题</label>
+                <textarea id="agentQuestion" rows="4" placeholder="例如：大模型在缺陷修复领域的最新进展"></textarea>
+                <div class="agent-example-row">
+                    <button type="button" class="agent-example-btn" data-agent-example="大模型在缺陷修复领域的最新进展">缺陷修复</button>
+                    <button type="button" class="agent-example-btn" data-agent-example="RAG 在代码生成领域的最新进展">RAG 代码生成</button>
+                    <button type="button" class="agent-example-btn" data-agent-example="多智能体软件工程自动化的研究趋势">多智能体软件工程</button>
+                </div>
+                <div class="form-row agent-form-row">
+                    <div class="form-group">
+                        <label for="agentTimeRange">时间范围</label>
+                        <select id="agentTimeRange">
+                            <option value="30">最近 30 天</option>
+                            <option value="90">最近 90 天</option>
+                            <option value="180" selected>最近 180 天</option>
+                            <option value="365">最近 1 年</option>
+                            <option value="1095">最近 3 年</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="agentMaxPapers">最大论文数</label>
+                        <select id="agentMaxPapers">
+                            <option value="15">15 篇</option>
+                            <option value="25" selected>25 篇</option>
+                            <option value="40">40 篇</option>
+                            <option value="60">60 篇</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="agentPapersPerQuery">每个子查询</label>
+                        <select id="agentPapersPerQuery">
+                            <option value="10">10 篇</option>
+                            <option value="15" selected>15 篇</option>
+                            <option value="25">25 篇</option>
+                            <option value="40">40 篇</option>
+                        </select>
+                    </div>
+                </div>
+                <button type="button" class="btn btn-primary" id="agentStartBtn" disabled>
+                    🧭 运行研究 Agent
+                </button>
+            </div>
+        </section>
+
         <!-- 进度区 -->
         <section class="progress-section hidden" id="progressSection">
             <div class="progress-header">
@@ -120,6 +198,36 @@
             </div>
             <div class="progress-bar-container">
                 <div class="progress-bar" id="progressBar"></div>
+            </div>
+            <div class="agent-progress-panel hidden" id="agentProgressPanel">
+                <div class="agent-progress-steps">
+                    <div class="agent-progress-step active" data-agent-step="intent">
+                        <span>1</span>
+                        <strong>理解问题</strong>
+                        <small>识别意图与关键词</small>
+                    </div>
+                    <div class="agent-progress-step" data-agent-step="queries">
+                        <span>2</span>
+                        <strong>生成子查询</strong>
+                        <small>拆分检索角度</small>
+                    </div>
+                    <div class="agent-progress-step" data-agent-step="search">
+                        <span>3</span>
+                        <strong>检索论文</strong>
+                        <small>arXiv 多路查询</small>
+                    </div>
+                    <div class="agent-progress-step" data-agent-step="synthesis">
+                        <span>4</span>
+                        <strong>提炼综述</strong>
+                        <small>趋势与证据</small>
+                    </div>
+                    <div class="agent-progress-step" data-agent-step="render">
+                        <span>5</span>
+                        <strong>渲染报告</strong>
+                        <small>整理结果页</small>
+                    </div>
+                </div>
+                <div class="agent-progress-note" id="agentProgressNote">正在准备研究任务...</div>
             </div>
             <div class="progress-details" id="progressDetails"></div>
         </section>
@@ -183,10 +291,55 @@
             </div>
             <div class="papers-container" id="papersContainer"></div>
         </section>
+
+        <!-- Agent 结果区 -->
+        <section class="agent-results-section hidden" id="agentResultsSection">
+            <div class="results-header">
+                <h2>🧭 研究 Agent 报告</h2>
+                <div class="results-actions">
+                    <button class="btn btn-secondary" id="agentBackBtn">← 返回 Agent</button>
+                    <button class="btn btn-primary" id="agentExportBtn">📥 导出 Markdown</button>
+                </div>
+            </div>
+            <div class="results-meta" id="agentResultsMeta"></div>
+            <div class="agent-results-grid">
+                <div class="agent-card">
+                    <h3>查询理解</h3>
+                    <div id="agentIntent"></div>
+                </div>
+                <div class="agent-card">
+                    <h3>数据源优先级</h3>
+                    <div id="agentSources"></div>
+                </div>
+            </div>
+            <div class="agent-card">
+                <h3>多步搜索策略</h3>
+                <div id="agentStrategy"></div>
+                <div class="agent-query-list" id="agentSubQueries"></div>
+            </div>
+            <div class="agent-card">
+                <h3>智能综述与知识提炼</h3>
+                <div id="agentSynthesis"></div>
+            </div>
+            <div class="agent-results-grid">
+                <div class="agent-card">
+                    <h3>质量评估</h3>
+                    <div id="agentEvaluation"></div>
+                </div>
+                <div class="agent-card">
+                    <h3>执行轨迹</h3>
+                    <div class="agent-trajectory-list" id="agentTrajectory"></div>
+                </div>
+            </div>
+            <div class="agent-card">
+                <h3>代表论文</h3>
+                <div class="agent-paper-list" id="agentPapers"></div>
+            </div>
+        </section>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
-    <script src="app.js?v=20260609-trend-llm-v2"></script>
+    <script src="app.js?v=20260625-research-agent-v2"></script>
 
     <!-- 精读弹窗 -->
     <div id="intensiveReadModal" class="modal-overlay hidden">

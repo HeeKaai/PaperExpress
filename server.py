@@ -21,10 +21,20 @@ import time
 import hashlib
 import ast
 
+from agent.research_agent import (
+    AGENT_PROMPT_VERSION,
+    DEFAULT_MAX_PAPERS as AGENT_DEFAULT_MAX_PAPERS,
+    DEFAULT_MAX_SUBQUERIES as AGENT_DEFAULT_MAX_SUBQUERIES,
+    DEFAULT_PAPERS_PER_QUERY as AGENT_DEFAULT_PAPERS_PER_QUERY,
+    DEFAULT_TIME_RANGE as AGENT_DEFAULT_TIME_RANGE,
+    normalize_question,
+    run_research_agent
+)
+
 # 缓存和提示词版本，用于避免不同提示词/数据结构之间误命中
 CACHE_SCHEMA_VERSION = 2
 TRANSLATION_PROMPT_VERSION = "translation-json-v1"
-STATIC_ASSET_VERSION = "20260609-trend-llm-v2"
+STATIC_ASSET_VERSION = "20260625-research-agent-v2"
 
 BANNED_TREND_LABELS = {
     "a", "an", "the", "and", "or", "of", "to", "in", "on", "for", "with", "by",
@@ -43,12 +53,28 @@ BANNED_TREND_LABELS = {
 DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
 PAPERS_DIR = os.path.join(DATA_DIR, 'papers')
 INTENSIVE_DIR = os.path.join(DATA_DIR, 'intensive')
+AGENT_DIR = os.path.join(DATA_DIR, 'agent')
 INDEX_FILE = os.path.join(DATA_DIR, 'index.json')
+
+
+def default_index():
+    """返回兼容所有历史记录类型的索引结构"""
+    return {"papers": {}, "intensive": {}, "agent": {}}
+
+
+def normalize_index(index):
+    """补齐旧版本索引缺失的历史记录分支"""
+    normalized = default_index()
+    if isinstance(index, dict):
+        for key in normalized:
+            if isinstance(index.get(key), dict):
+                normalized[key] = index.get(key, {})
+    return normalized
 
 
 def ensure_data_dirs():
     """确保数据目录存在"""
-    for d in [DATA_DIR, PAPERS_DIR, INTENSIVE_DIR]:
+    for d in [DATA_DIR, PAPERS_DIR, INTENSIVE_DIR, AGENT_DIR]:
         if not os.path.exists(d):
             os.makedirs(d, exist_ok=True)
 
@@ -57,17 +83,18 @@ def load_index():
     """加载索引文件"""
     ensure_data_dirs()
     if not os.path.exists(INDEX_FILE):
-        return {"papers": {}, "intensive": {}}
+        return default_index()
     try:
         with open(INDEX_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            return normalize_index(json.load(f))
     except Exception:
-        return {"papers": {}, "intensive": {}}
+        return default_index()
 
 
 def save_index(index):
     """保存索引文件"""
     ensure_data_dirs()
+    index = normalize_index(index)
     with open(INDEX_FILE, 'w', encoding='utf-8') as f:
         json.dump(index, f, ensure_ascii=False, indent=2)
 
@@ -125,6 +152,24 @@ def paper_config_hash(categories, time_range, max_papers, keywords='', model_nam
 def intensive_hash(arXiv_id, paper_title):
     """精读记录的哈希值（基于论文ID和标题）"""
     return compute_hash(arXiv_id, paper_title[:100])
+
+
+def agent_config_hash(question, time_range, max_papers, papers_per_query, model_name='',
+                      max_subqueries=AGENT_DEFAULT_MAX_SUBQUERIES,
+                      prompt_version=AGENT_PROMPT_VERSION, date_bucket=None):
+    """研究 Agent 配置的哈希值"""
+    bucket = date_bucket or current_utc_date_bucket()
+    return compute_hash(
+        CACHE_SCHEMA_VERSION,
+        prompt_version,
+        normalize_question(question).lower(),
+        time_range,
+        max_papers,
+        papers_per_query,
+        max_subqueries,
+        model_name,
+        bucket
+    )
 
 
 def get_papers_record(hash_key):
@@ -190,6 +235,38 @@ def save_intensive_record(hash_key, record):
     save_index(index)
 
 
+def get_agent_record(hash_key):
+    """获取研究 Agent 记录"""
+    path = os.path.join(AGENT_DIR, f"{hash_key}.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_agent_record(hash_key, record):
+    """保存研究 Agent 记录"""
+    ensure_data_dirs()
+    path = os.path.join(AGENT_DIR, f"{hash_key}.json")
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(record, f, ensure_ascii=False, indent=2)
+
+    result = record.get('result', {})
+    stats = result.get('stats', {}) if isinstance(result, dict) else {}
+    index = load_index()
+    index['agent'][hash_key] = {
+        "title": record.get('title', '研究 Agent'),
+        "question": record.get('question', ''),
+        "created": record.get('created', datetime.now().isoformat()),
+        "count": stats.get('finalPapers', len(result.get('papers', [])) if isinstance(result, dict) else 0),
+        "model": record.get('model', '')
+    }
+    save_index(index)
+
+
 def delete_papers_record(hash_key):
     """删除论文速递记录"""
     path = os.path.join(PAPERS_DIR, f"{hash_key}.json")
@@ -209,6 +286,17 @@ def delete_intensive_record(hash_key):
     index = load_index()
     if hash_key in index['intensive']:
         del index['intensive'][hash_key]
+        save_index(index)
+
+
+def delete_agent_record(hash_key):
+    """删除研究 Agent 记录"""
+    path = os.path.join(AGENT_DIR, f"{hash_key}.json")
+    if os.path.exists(path):
+        os.remove(path)
+    index = load_index()
+    if hash_key in index['agent']:
+        del index['agent'][hash_key]
         save_index(index)
 
 
@@ -286,6 +374,7 @@ ARXIV_CATEGORIES = {
 def parse_keyword_terms(keywords):
     """解析自由关键词，支持普通空格分词和英文引号短语"""
     normalized = normalize_keywords(keywords)
+    normalized = normalized.replace('“', '"').replace('”', '"').replace('‘', "'").replace('’', "'")
     if not normalized:
         return []
 
@@ -293,7 +382,7 @@ def parse_keyword_terms(keywords):
     for quoted, token in re.findall(r'"([^"]+)"|([^\s,;]+)', normalized):
         term = (quoted or token).strip()
         # 只把用户输入当作普通关键词，不开放 arXiv 字段语法注入。
-        term = re.sub(r'["():\[\]{}]', ' ', term)
+        term = re.sub(r'["“”‘’():\[\]{}]', ' ', term)
         term = re.sub(r'\s+', ' ', term).strip()
         if term:
             terms.append(term)
@@ -1344,6 +1433,11 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
             response = self._handle_history_intensive_get(hash_key)
             self._set_headers()
             self.wfile.write(json.dumps(response, ensure_ascii=False).encode("utf-8"))
+        elif path.startswith("/api/history/agent/"):
+            hash_key = path.split("/")[-1]
+            response = self._handle_history_agent_get(hash_key)
+            self._set_headers()
+            self.wfile.write(json.dumps(response, ensure_ascii=False).encode("utf-8"))
         else:
             # 尝试提供静态文件
             if not self.serve_static_file(self.path):
@@ -1372,6 +1466,11 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
             elif path.startswith("/api/history/intensive/"):
                 hash_key = path.split("/")[-1]
                 response = self._handle_history_intensive_delete(hash_key)
+                self._set_headers()
+                self.wfile.write(json.dumps(response, ensure_ascii=False).encode("utf-8"))
+            elif path.startswith("/api/history/agent/"):
+                hash_key = path.split("/")[-1]
+                response = self._handle_history_agent_delete(hash_key)
                 self._set_headers()
                 self.wfile.write(json.dumps(response, ensure_ascii=False).encode("utf-8"))
             else:
@@ -1409,6 +1508,8 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
                 response = self._handle_intensive_read(data)
             elif path == "/api/trend_summary":
                 response = self._handle_trend_summary(data)
+            elif path == "/api/agent/research":
+                response = self._handle_agent_research(data)
             elif path == "/api/history/check":
                 response = self._handle_history_check(data)
             else:
@@ -1615,6 +1716,99 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
             "result": result
         }
 
+    def _handle_agent_research(self, data):
+        """处理研究 Agent 请求"""
+        question = normalize_question(data.get("question", ""))
+        llm_config = data.get("llm", {})
+        save_cache = data.get("saveCache", True)
+
+        if not question:
+            return {"success": False, "error": "研究问题不能为空"}
+
+        try:
+            time_range = int(data.get("timeRange", AGENT_DEFAULT_TIME_RANGE))
+        except Exception:
+            time_range = AGENT_DEFAULT_TIME_RANGE
+        time_range = max(1, min(3650, time_range))
+
+        try:
+            max_papers = int(data.get("maxPapers", AGENT_DEFAULT_MAX_PAPERS))
+        except Exception:
+            max_papers = AGENT_DEFAULT_MAX_PAPERS
+        max_papers = max(1, min(80, max_papers))
+
+        try:
+            papers_per_query = int(data.get("papersPerQuery", AGENT_DEFAULT_PAPERS_PER_QUERY))
+        except Exception:
+            papers_per_query = AGENT_DEFAULT_PAPERS_PER_QUERY
+        papers_per_query = max(1, min(50, papers_per_query))
+
+        try:
+            max_subqueries = int(data.get("maxSubQueries", AGENT_DEFAULT_MAX_SUBQUERIES))
+        except Exception:
+            max_subqueries = AGENT_DEFAULT_MAX_SUBQUERIES
+        max_subqueries = max(1, min(AGENT_DEFAULT_MAX_SUBQUERIES, max_subqueries))
+
+        model_name = llm_config.get("model", "")
+        cache_hash = agent_config_hash(question, time_range, max_papers, papers_per_query, model_name, max_subqueries)
+
+        if save_cache:
+            cached = get_agent_record(cache_hash)
+            if cached and isinstance(cached.get("result"), dict):
+                print(f"[agent] 命中缓存: {cache_hash}")
+                response = dict(cached.get("result", {}))
+                response.update({
+                    "success": True,
+                    "cached": True,
+                    "hash": cache_hash,
+                    "cacheCreated": cached.get("created", "")
+                })
+                return response
+
+        helpers = {
+            "post_llm_json_request": post_llm_json_request,
+            "parse_json_like": parse_json_like,
+            "extract_llm_response_text": extract_llm_response_text,
+            "truncate_text": truncate_text
+        }
+
+        result = run_research_agent(
+            question=question,
+            time_range=time_range,
+            max_papers=max_papers,
+            papers_per_query=papers_per_query,
+            llm_config=llm_config,
+            fetch_papers=fetch_arxiv_papers,
+            helpers=helpers,
+            safe_print=safe_print,
+            max_subqueries=max_subqueries
+        )
+
+        if save_cache:
+            cache_record = {
+                "schemaVersion": CACHE_SCHEMA_VERSION,
+                "promptVersion": AGENT_PROMPT_VERSION,
+                "title": f"研究 Agent: {question[:60]}",
+                "question": question,
+                "timeRange": time_range,
+                "maxPapers": max_papers,
+                "papersPerQuery": papers_per_query,
+                "maxSubQueries": max_subqueries,
+                "model": model_name,
+                "result": result,
+                "created": datetime.now().isoformat()
+            }
+            save_agent_record(cache_hash, cache_record)
+            print(f"[agent] 已保存缓存: {cache_hash}")
+
+        response = dict(result)
+        response.update({
+            "success": True,
+            "cached": False,
+            "hash": cache_hash
+        })
+        return response
+
     def _handle_intensive_read(self, data):
         """处理论文精读请求"""
         paper = data.get("paper", {})
@@ -1726,6 +1920,26 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
                 }
             return {"success": True, "cached": False, "hash": cache_hash}
 
+        elif check_type == "agent":
+            question = normalize_question(data.get("question", ""))
+            time_range = data.get("timeRange", AGENT_DEFAULT_TIME_RANGE)
+            max_papers = data.get("maxPapers", AGENT_DEFAULT_MAX_PAPERS)
+            papers_per_query = data.get("papersPerQuery", AGENT_DEFAULT_PAPERS_PER_QUERY)
+            max_subqueries = data.get("maxSubQueries", AGENT_DEFAULT_MAX_SUBQUERIES)
+            model_name = data.get("model", "")
+            cache_hash = agent_config_hash(question, time_range, max_papers, papers_per_query, model_name, max_subqueries)
+            cached = get_agent_record(cache_hash)
+            if cached:
+                return {
+                    "success": True,
+                    "cached": True,
+                    "hash": cache_hash,
+                    "title": cached.get("title", ""),
+                    "question": cached.get("question", ""),
+                    "created": cached.get("created", "")
+                }
+            return {"success": True, "cached": False, "hash": cache_hash}
+
         return {"success": False, "error": "未知的检查类型"}
 
     def _handle_history_list(self):
@@ -1739,10 +1953,18 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
                     paper_count = len(record.get("papers", []))
                 meta["count"] = paper_count
                 meta["keywords"] = record.get("keywords", meta.get("keywords", ""))
+        for key, meta in index.get("agent", {}).items():
+            record = get_agent_record(key)
+            if record and isinstance(record.get("result"), dict):
+                result = record.get("result", {})
+                stats = result.get("stats", {})
+                meta["count"] = stats.get("finalPapers", len(result.get("papers", [])))
+                meta["question"] = record.get("question", meta.get("question", ""))
         return {
             "success": True,
             "papers": index.get("papers", {}),
-            "intensive": index.get("intensive", {})
+            "intensive": index.get("intensive", {}),
+            "agent": index.get("agent", {})
         }
 
     def _handle_history_papers_get(self, hash_key):
@@ -1767,6 +1989,18 @@ class PaperExpressHandler(BaseHTTPRequestHandler):
     def _handle_history_intensive_delete(self, hash_key):
         """删除精读记录"""
         delete_intensive_record(hash_key)
+        return {"success": True}
+
+    def _handle_history_agent_get(self, hash_key):
+        """获取指定研究 Agent 记录"""
+        record = get_agent_record(hash_key)
+        if record:
+            return {"success": True, "record": record}
+        return {"success": False, "error": "记录不存在"}
+
+    def _handle_history_agent_delete(self, hash_key):
+        """删除研究 Agent 记录"""
+        delete_agent_record(hash_key)
         return {"success": True}
 
     def _handle_load_config(self):
@@ -1822,6 +2056,7 @@ def run_server(port=8080):
 ║    - POST /api/translate_batch 批量翻译(支持并发)        ║
 ║    - POST /api/intensive_read  论文精读分析              ║
 ║    - POST /api/trend_summary   LLM 趋势摘要              ║
+║    - POST /api/agent/research  研究 Agent                ║
 ║    - POST /api/test           测试 LLM 连接              ║
 ║                                                          ║
 ║  在浏览器打开上述地址即可使用                              ║

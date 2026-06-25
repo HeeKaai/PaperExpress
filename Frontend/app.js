@@ -12,6 +12,8 @@ let translateStartTime = 0;
 let translationStats = null;
 let currentRunConfig = null;
 let trendRequestSeq = 0;
+let currentAgentResult = null;
+let isAgentProcessing = false;
 
 // API 基础 URL - 后端和前端在同一个服务器上，使用相对路径
 const API_BASE = '';
@@ -20,10 +22,28 @@ const API_BASE = '';
 const configSection = document.getElementById('configSection');
 const progressSection = document.getElementById('progressSection');
 const resultsSection = document.getElementById('resultsSection');
+const agentWorkspaceSection = document.getElementById('agentWorkspaceSection');
+const agentResultsSection = document.getElementById('agentResultsSection');
 const startBtn = document.getElementById('startBtn');
 const backBtn = document.getElementById('backBtn');
 const exportBtn = document.getElementById('exportBtn');
+const openAgentPageBtn = document.getElementById('openAgentPageBtn');
+const agentStartBtn = document.getElementById('agentStartBtn');
+const agentWorkspaceBackBtn = document.getElementById('agentWorkspaceBackBtn');
+const agentBackBtn = document.getElementById('agentBackBtn');
+const agentExportBtn = document.getElementById('agentExportBtn');
+const agentProgressPanel = document.getElementById('agentProgressPanel');
+const agentProgressNote = document.getElementById('agentProgressNote');
 const serverStatus = document.getElementById('serverStatus');
+let agentProgressTimer = null;
+
+const agentProgressFlow = [
+    { key: 'intent', percent: 12, status: '正在理解研究问题...', note: '正在识别研究对象、任务边界和关键英文术语。' },
+    { key: 'queries', percent: 28, status: '正在生成多角度子查询...', note: '正在把开放问题拆成扩展、细化、方法和评测角度。' },
+    { key: 'search', percent: 52, status: '正在检索 arXiv...', note: '正在执行多路 arXiv 查询，并准备去重排序。' },
+    { key: 'synthesis', percent: 74, status: '正在提炼综述...', note: '正在基于命中论文提炼趋势、方法路线、证据和局限。' },
+    { key: 'render', percent: 90, status: '正在整理报告...', note: '正在组织查询理解、搜索策略、代表论文和综述结果。' }
+];
 
 // 初始化
 document.addEventListener('DOMContentLoaded', () => {
@@ -88,6 +108,30 @@ function setupEventListeners() {
     // 开始按钮
     startBtn.addEventListener('click', handleStart);
 
+    // 研究 Agent
+    openAgentPageBtn.addEventListener('click', () => {
+        showSection('agentWorkspace');
+        history.pushState(null, '', '#agent');
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+    agentStartBtn.addEventListener('click', handleAgentStart);
+    agentWorkspaceBackBtn.addEventListener('click', () => {
+        showSection('config');
+        history.pushState(null, '', window.location.pathname + window.location.search);
+    });
+    agentBackBtn.addEventListener('click', () => {
+        showSection('agentWorkspace');
+        history.pushState(null, '', '#agent');
+    });
+    agentExportBtn.addEventListener('click', exportAgentMarkdown);
+    document.getElementById('agentQuestion').addEventListener('input', updateAgentButton);
+    document.querySelectorAll('[data-agent-example]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.getElementById('agentQuestion').value = btn.dataset.agentExample || '';
+            updateAgentButton();
+        });
+    });
+
     // 返回按钮
     backBtn.addEventListener('click', () => showSection('config'));
 
@@ -99,6 +143,11 @@ function setupEventListeners() {
 
     // 关键词输入也可以独立触发搜索
     document.getElementById('keywordSearch').addEventListener('input', updateStartButton);
+
+    updateAgentButton();
+    if (window.location.hash === '#agent') {
+        showSection('agentWorkspace');
+    }
 }
 
 // 加载学科分类
@@ -287,6 +336,11 @@ function updateStartButton() {
     }
 }
 
+function updateAgentButton() {
+    const question = document.getElementById('agentQuestion').value.trim();
+    agentStartBtn.disabled = question.length === 0 || isAgentProcessing;
+}
+
 // 从服务器加载配置文件
 async function loadConfigFromServer() {
     const btn = document.getElementById('loadConfigBtn');
@@ -380,6 +434,8 @@ async function handleStart() {
     translateStartTime = Date.now();
 
     showSection('progress');
+    stopAgentProgressTicker();
+    hideAgentProgressPanel();
     document.getElementById('progressDetails').innerHTML = '';
 
     try {
@@ -494,15 +550,189 @@ function getConfig() {
     };
 }
 
+function getAgentConfig() {
+    return {
+        question: document.getElementById('agentQuestion').value.trim(),
+        timeRange: parseInt(document.getElementById('agentTimeRange').value),
+        maxPapers: parseInt(document.getElementById('agentMaxPapers').value),
+        papersPerQuery: parseInt(document.getElementById('agentPapersPerQuery').value),
+        llm: getLLMConfig()
+    };
+}
+
+async function handleAgentStart() {
+    if (isAgentProcessing) return;
+
+    const config = getAgentConfig();
+    if (!config.question) {
+        alert('请输入研究问题');
+        return;
+    }
+    if (!config.llm.endpoint || !config.llm.model) {
+        alert('请先配置 LLM API');
+        return;
+    }
+
+    isAgentProcessing = true;
+    updateAgentButton();
+    currentAgentResult = null;
+
+    showSection('progress');
+    document.getElementById('progressDetails').innerHTML = '';
+    showAgentProgressPanel();
+    startAgentProgressTicker();
+    updateProgress(5, '研究 Agent 启动中...', '开始理解研究问题并生成搜索策略...');
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 900000);
+
+    try {
+        setAgentProgressStep('intent');
+        updateProgress(20, '正在规划多步检索...', '调用 LLM 生成意图识别和子查询...');
+        const response = await fetch(`${API_BASE}/api/agent/research`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(config),
+            signal: controller.signal
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(errorData.error || '研究 Agent 请求失败');
+        }
+
+        const data = await response.json();
+        if (!data.success) {
+            throw new Error(data.error || '研究 Agent 运行失败');
+        }
+
+        stopAgentProgressTicker();
+        setAgentProgressStep('render');
+        updateProgress(85, '正在渲染研究报告...', data.cached ? '✓ 命中研究 Agent 缓存' : '✓ 已完成检索和综述生成');
+
+        currentAgentResult = {
+            question: data.question || config.question,
+            intent: data.intent || {},
+            strategy: data.strategy || {},
+            subQueries: data.subQueries || [],
+            sourcePriorities: data.sourcePriorities || [],
+            papers: data.papers || [],
+            synthesis: data.synthesis || {},
+            evaluation: data.evaluation || {},
+            trajectory: data.trajectory || [],
+            stats: data.stats || {},
+            cached: !!data.cached,
+            hash: data.hash || '',
+            cacheCreated: data.cacheCreated || ''
+        };
+
+        renderAgentResults(currentAgentResult, data.cached);
+        markAgentProgressDone();
+        updateProgress(100, '研究 Agent 完成!', data.cached ? '✓ 报告来自历史缓存' : '✓ 研究报告已生成');
+        showSection('agentResults');
+    } catch (error) {
+        clearTimeout(timeoutId);
+        stopAgentProgressTicker();
+        markAgentProgressFailed();
+        const message = error.name === 'AbortError'
+            ? '请求超时（超过15分钟），请稍后重试或减少论文数'
+            : error.message;
+        updateProgress(0, '研究 Agent 失败', `✗ 错误: ${message}`);
+        alert(`研究 Agent 运行失败: ${message}`);
+        showSection('config');
+    } finally {
+        isAgentProcessing = false;
+        updateAgentButton();
+    }
+}
+
+function showAgentProgressPanel() {
+    if (!agentProgressPanel) return;
+    agentProgressPanel.classList.remove('hidden');
+    setAgentProgressStep('intent');
+}
+
+function hideAgentProgressPanel() {
+    if (!agentProgressPanel) return;
+    agentProgressPanel.classList.add('hidden');
+}
+
+function setAgentProgressStep(stepKey) {
+    if (!agentProgressPanel) return;
+
+    const steps = Array.from(agentProgressPanel.querySelectorAll('.agent-progress-step'));
+    const activeIndex = steps.findIndex(step => step.dataset.agentStep === stepKey);
+
+    steps.forEach((step, index) => {
+        step.classList.toggle('active', index === activeIndex);
+        step.classList.toggle('done', activeIndex > -1 && index < activeIndex);
+        step.classList.remove('failed');
+    });
+
+    const flowItem = agentProgressFlow.find(item => item.key === stepKey);
+    if (flowItem && agentProgressNote) {
+        agentProgressNote.textContent = flowItem.note;
+    }
+}
+
+function startAgentProgressTicker() {
+    stopAgentProgressTicker();
+    let index = 0;
+    setAgentProgressStep(agentProgressFlow[index].key);
+
+    agentProgressTimer = setInterval(() => {
+        index = Math.min(index + 1, agentProgressFlow.length - 2);
+        const item = agentProgressFlow[index];
+        setAgentProgressStep(item.key);
+        updateProgress(item.percent, item.status);
+    }, 4500);
+}
+
+function stopAgentProgressTicker() {
+    if (!agentProgressTimer) return;
+    clearInterval(agentProgressTimer);
+    agentProgressTimer = null;
+}
+
+function markAgentProgressDone() {
+    if (!agentProgressPanel) return;
+    agentProgressPanel.querySelectorAll('.agent-progress-step').forEach(step => {
+        step.classList.add('done');
+        step.classList.remove('active', 'failed');
+    });
+    if (agentProgressNote) {
+        agentProgressNote.textContent = '研究报告已生成。';
+    }
+}
+
+function markAgentProgressFailed() {
+    if (!agentProgressPanel) return;
+    const active = agentProgressPanel.querySelector('.agent-progress-step.active');
+    if (active) {
+        active.classList.add('failed');
+    }
+    if (agentProgressNote) {
+        agentProgressNote.textContent = '研究 Agent 运行失败，请查看错误信息后重试。';
+    }
+}
+
 // 显示区域
 function showSection(section) {
     configSection.classList.add('hidden');
     progressSection.classList.add('hidden');
     resultsSection.classList.add('hidden');
+    agentWorkspaceSection.classList.add('hidden');
+    agentResultsSection.classList.add('hidden');
 
     if (section === 'config') configSection.classList.remove('hidden');
+    if (section === 'agentWorkspace') agentWorkspaceSection.classList.remove('hidden');
     if (section === 'progress') progressSection.classList.remove('hidden');
     if (section === 'results') resultsSection.classList.remove('hidden');
+    if (section === 'agentResults') agentResultsSection.classList.remove('hidden');
 }
 
 // 更新进度
@@ -624,6 +854,388 @@ function renderResults(papers, config, stats, cached) {
 
     // 渲染数学公式
     renderMathInElement(container);
+}
+
+// ==================== 研究 Agent ====================
+
+function asArray(value) {
+    if (Array.isArray(value)) return value.filter(item => item !== null && item !== undefined && String(item).trim());
+    if (value === null || value === undefined || value === '') return [];
+    return [value];
+}
+
+function compactText(value, fallback = '') {
+    if (Array.isArray(value)) return value.map(item => String(item)).join('、');
+    if (value === null || value === undefined || value === '') return fallback;
+    return String(value);
+}
+
+function renderAgentResults(result, cached) {
+    const meta = document.getElementById('agentResultsMeta');
+    const stats = result.stats || {};
+    const cachedBadge = cached ? '<span class="cached-badge">📦 来自缓存</span>' : '';
+    const tokenText = stats.totalTokens ? ` | <strong>Tokens:</strong> ${stats.totalTokens.toLocaleString()}` : '';
+    meta.innerHTML = `
+        <strong>问题:</strong> ${escapeHtml(result.question || '')} |
+        <strong>子查询:</strong> ${stats.totalQueries || (result.subQueries || []).length} |
+        <strong>论文:</strong> ${stats.finalPapers || (result.papers || []).length} |
+        <strong>时间范围:</strong> 最近 ${stats.timeRange || '-'} 天${tokenText}
+        ${cachedBadge}
+    `;
+
+    renderAgentIntent(result.intent || {});
+    renderAgentSources(result.sourcePriorities || []);
+    renderAgentStrategy(result.strategy || {}, result.subQueries || []);
+    renderAgentSynthesis(result.synthesis || {});
+    renderAgentEvaluation(result.evaluation || {});
+    renderAgentTrajectory(result.trajectory || []);
+    renderAgentPapers(result.papers || []);
+    renderMathInElement(agentResultsSection);
+}
+
+function renderAgentIntent(intent) {
+    const container = document.getElementById('agentIntent');
+    const rows = [
+        ['研究主题', intent.researchTopic],
+        ['任务领域', intent.taskDomain],
+        ['关键实体', intent.keyEntities],
+        ['同义扩展', intent.synonyms],
+        ['时间倾向', intent.timeSensitivity],
+        ['纳入范围', intent.inScope],
+        ['排除范围', intent.outOfScope]
+    ];
+
+    container.innerHTML = rows
+        .filter(([, value]) => compactText(value).trim())
+        .map(([label, value]) => `
+            <div class="agent-kv-row">
+                <span class="agent-kv-label">${escapeHtml(label)}</span>
+                <span class="agent-kv-value render-math">${escapeHtml(compactText(value))}</span>
+            </div>
+        `).join('') || '<div class="trend-empty">暂无查询理解信息</div>';
+}
+
+function renderAgentSources(sources) {
+    const container = document.getElementById('agentSources');
+    if (!sources.length) {
+        container.innerHTML = '<div class="trend-empty">暂无数据源信息</div>';
+        return;
+    }
+
+    container.innerHTML = sources.map(source => `
+        <div class="agent-source-row">
+            <div>
+                <strong>${escapeHtml(source.name || '')}</strong>
+                <span class="agent-badge">${escapeHtml(source.status || '')}</span>
+            </div>
+            <div class="agent-muted render-math">${escapeHtml(source.reason || '')}</div>
+        </div>
+    `).join('');
+}
+
+function renderAgentStrategy(strategy, subQueries) {
+    const strategyContainer = document.getElementById('agentStrategy');
+    const queryContainer = document.getElementById('agentSubQueries');
+    const angles = asArray(strategy.searchAngles);
+    strategyContainer.innerHTML = `
+        <p class="agent-overview render-math">${escapeHtml(strategy.overview || '已生成多角度 arXiv 检索策略。')}</p>
+        ${angles.length ? `<div class="agent-chip-row">${angles.map(angle => `<span class="agent-chip">${escapeHtml(angle)}</span>`).join('')}</div>` : ''}
+    `;
+
+    if (!subQueries.length) {
+        queryContainer.innerHTML = '<div class="trend-empty">暂无子查询</div>';
+        return;
+    }
+
+    queryContainer.innerHTML = subQueries.map(query => {
+        const categories = asArray(query.arxivCategories).join(', ');
+        const error = query.error ? `<div class="agent-error">检索失败: ${escapeHtml(query.error)}</div>` : '';
+        const relaxed = query.relaxedQuery ? `
+            <div class="agent-relaxed-query">
+                <strong>宽松重试:</strong> ${escapeHtml(query.relaxedQuery)}
+                ${query.relaxationNote ? `<span>${escapeHtml(query.relaxationNote)}</span>` : ''}
+            </div>
+        ` : '';
+        return `
+            <div class="agent-query-item">
+                <div class="agent-query-head">
+                    <span class="agent-query-id">${escapeHtml(query.id || '')}</span>
+                    <strong>${escapeHtml(query.angle || '')}</strong>
+                    <span class="agent-badge">${Number(query.resultCount || 0)} 篇</span>
+                </div>
+                <div class="agent-query-text">${escapeHtml(query.query || '')}</div>
+                ${relaxed}
+                <div class="agent-muted">分类: ${escapeHtml(categories || '默认')}</div>
+                ${query.rationale ? `<div class="agent-muted render-math">${escapeHtml(query.rationale)}</div>` : ''}
+                ${error}
+            </div>
+        `;
+    }).join('');
+}
+
+function renderEvidence(evidence) {
+    const items = asArray(evidence);
+    if (!items.length) return '';
+    return `<div class="agent-evidence">证据: ${items.map(item => `<span>#${escapeHtml(item)}</span>`).join(' ')}</div>`;
+}
+
+function renderAgentSynthesis(synthesis) {
+    const container = document.getElementById('agentSynthesis');
+    const parts = [];
+
+    parts.push(`<div class="agent-overview render-math">${escapeHtml(synthesis.overview || '暂无综述内容')}</div>`);
+    parts.push(renderAgentInsightGroup('关键趋势', synthesis.keyTrends || [], item => `
+        <div class="agent-insight-title">${escapeHtml(item.label || '')}</div>
+        <div class="render-math">${escapeHtml(item.summary || '')}</div>
+        ${renderEvidence(item.evidence)}
+    `));
+    parts.push(renderAgentInsightGroup('方法路线', synthesis.methodMap || [], item => `
+        <div class="agent-insight-title">${escapeHtml(item.method || '')}</div>
+        <div class="render-math">${escapeHtml(item.description || '')}</div>
+        ${renderEvidence(item.evidence)}
+    `));
+    parts.push(renderAgentInsightGroup('代表性论文判断', synthesis.representativePapers || [], item => `
+        <div class="agent-insight-title">#${escapeHtml(item.index || '')} ${escapeHtml(item.title || '')}</div>
+        <div class="render-math">${escapeHtml(item.reason || '')}</div>
+    `));
+    parts.push(renderAgentTextList('局限与证据边界', synthesis.limitations || []));
+    parts.push(renderAgentTextList('后续方向', synthesis.futureDirections || []));
+
+    container.innerHTML = parts.join('');
+}
+
+function renderAgentEvaluation(evaluation) {
+    const container = document.getElementById('agentEvaluation');
+    if (!container) return;
+
+    if (!evaluation || Object.keys(evaluation).length === 0) {
+        container.innerHTML = '<div class="trend-empty">暂无质量评估信息</div>';
+        return;
+    }
+
+    const score = Number(evaluation.score || 0);
+    const level = evaluation.coverageLevel || 'limited';
+    const issues = asArray(evaluation.issues);
+    const recommendations = asArray(evaluation.recommendations);
+
+    container.innerHTML = `
+        <div class="agent-evaluation-head">
+            <div class="agent-score agent-score-${escapeHtml(level)}">${score}</div>
+            <div>
+                <div class="agent-evaluation-title">${escapeHtml(evaluation.coverageLabel || '覆盖评估')}</div>
+                <div class="agent-muted">
+                    证据论文 ${Number(evaluation.evidencePaperCount || 0)} 篇，
+                    空查询 ${Number(evaluation.zeroResultQueryCount || 0)} 个，
+                    宽松重试 ${Number(evaluation.relaxedQueryCount || 0)} 次
+                </div>
+            </div>
+        </div>
+        ${issues.length ? `
+            <div class="agent-subsection">
+                <h4>风险提示</h4>
+                <ul class="agent-text-list">${issues.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>
+            </div>
+        ` : ''}
+        ${recommendations.length ? `
+            <div class="agent-subsection">
+                <h4>改进建议</h4>
+                <ul class="agent-text-list">${recommendations.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>
+            </div>
+        ` : ''}
+    `;
+}
+
+function renderAgentTrajectory(trajectory) {
+    const container = document.getElementById('agentTrajectory');
+    if (!container) return;
+
+    const steps = asArray(trajectory);
+    if (!steps.length) {
+        container.innerHTML = '<div class="trend-empty">暂无执行轨迹</div>';
+        return;
+    }
+
+    container.innerHTML = steps.map(step => {
+        const input = step.input && typeof step.input === 'object'
+            ? compactTrajectoryInput(step.input)
+            : compactText(step.input);
+        const output = compactText(step.outputSummary);
+        return `
+            <div class="agent-trajectory-item agent-trajectory-${escapeHtml(step.status || 'success')}">
+                <div class="agent-trajectory-index">${Number(step.index || 0)}</div>
+                <div class="agent-trajectory-body">
+                    <div class="agent-trajectory-head">
+                        <strong>${escapeHtml(step.title || '')}</strong>
+                        <span>${escapeHtml(step.type || 'step')}</span>
+                    </div>
+                    ${step.content ? `<div class="agent-muted render-math">${escapeHtml(step.content)}</div>` : ''}
+                    ${step.tool ? `<div class="agent-trajectory-tool">Tool: ${escapeHtml(step.tool)}</div>` : ''}
+                    ${input ? `<div class="agent-trajectory-io">输入：${escapeHtml(input)}</div>` : ''}
+                    ${output ? `<div class="agent-trajectory-io">输出：${escapeHtml(output)}</div>` : ''}
+                </div>
+            </div>
+        `;
+    }).join('');
+}
+
+function compactTrajectoryInput(input) {
+    const parts = [];
+    if (input.queryId) parts.push(input.queryId);
+    if (input.angle) parts.push(input.angle);
+    if (input.query) parts.push(input.query);
+    if (input.categories) parts.push(`分类 ${asArray(input.categories).join(', ')}`);
+    if (input.timeRange) parts.push(`最近 ${input.timeRange} 天`);
+    return parts.join(' | ');
+}
+
+function renderAgentInsightGroup(title, items, renderItem) {
+    if (!items || items.length === 0) return '';
+    return `
+        <div class="agent-subsection">
+            <h4>${escapeHtml(title)}</h4>
+            <div class="agent-insight-list">
+                ${items.map(item => `<div class="agent-insight-item">${renderItem(item)}</div>`).join('')}
+            </div>
+        </div>
+    `;
+}
+
+function renderAgentTextList(title, items) {
+    const values = asArray(items);
+    if (!values.length) return '';
+    return `
+        <div class="agent-subsection">
+            <h4>${escapeHtml(title)}</h4>
+            <ul class="agent-text-list">
+                ${values.map(item => `<li class="render-math">${escapeHtml(item)}</li>`).join('')}
+            </ul>
+        </div>
+    `;
+}
+
+function renderAgentPapers(papers) {
+    const container = document.getElementById('agentPapers');
+    if (!papers.length) {
+        container.innerHTML = '<div class="trend-empty">当前策略未检索到论文</div>';
+        return;
+    }
+
+    container.innerHTML = papers.map((paper, index) => {
+        const authors = asArray(paper.authors).slice(0, 5).join(', ');
+        const angles = asArray(paper.matchAngles).join('、');
+        const score = Number(paper.relevanceScore || 0).toFixed(2);
+        return `
+            <div class="agent-paper-item">
+                <div class="agent-paper-index">#${index + 1}</div>
+                <div class="agent-paper-body">
+                    <div class="agent-paper-title">
+                        <a href="${paper.link || paper.pdfLink || '#'}" target="_blank" rel="noopener">${escapeHtml(paper.title || '')}</a>
+                    </div>
+                    <div class="agent-muted">${escapeHtml(authors)}</div>
+                    <div class="agent-muted">📅 ${escapeHtml(paper.published || '')} | 🏷️ ${escapeHtml(paper.primaryCategory || '')} | 相关度 ${score}</div>
+                    ${angles ? `<div class="agent-chip-row">${asArray(paper.matchAngles).map(angle => `<span class="agent-chip">${escapeHtml(angle)}</span>`).join('')}</div>` : ''}
+                    <div class="agent-paper-abstract render-math">${escapeHtml(paper.abstract || '')}</div>
+                </div>
+            </div>
+        `;
+    }).join('');
+}
+
+function exportAgentMarkdown() {
+    if (!currentAgentResult) return;
+
+    const result = currentAgentResult;
+    const date = new Date().toLocaleDateString('zh-CN');
+    const stats = result.stats || {};
+    let markdown = `# 🧭 PaperExpress 研究 Agent 报告\n\n`;
+    markdown += `**生成日期:** ${date}  \n`;
+    markdown += `**研究问题:** ${result.question || ''}  \n`;
+    markdown += `**时间范围:** 最近 ${stats.timeRange || '-'} 天  \n`;
+    markdown += `**论文数量:** ${(result.papers || []).length} 篇\n\n`;
+
+    markdown += `## 查询理解\n\n`;
+    const intent = result.intent || {};
+    markdown += `- 研究主题：${compactText(intent.researchTopic)}\n`;
+    markdown += `- 任务领域：${compactText(intent.taskDomain)}\n`;
+    markdown += `- 关键实体：${compactText(intent.keyEntities)}\n`;
+    markdown += `- 同义扩展：${compactText(intent.synonyms)}\n\n`;
+
+    markdown += `## 多步搜索策略\n\n`;
+    markdown += `${(result.strategy || {}).overview || ''}\n\n`;
+    (result.subQueries || []).forEach(query => {
+        markdown += `- **${query.id} ${query.angle}:** ${query.query} (${query.resultCount || 0} 篇)\n`;
+    });
+    markdown += `\n`;
+
+    markdown += `## 智能综述\n\n`;
+    const synthesis = result.synthesis || {};
+    markdown += `${synthesis.overview || ''}\n\n`;
+    markdown += markdownAgentItems('关键趋势', synthesis.keyTrends || [], item =>
+        `- **${item.label || ''}:** ${item.summary || ''}${markdownEvidence(item.evidence)}`
+    );
+    markdown += markdownAgentItems('方法路线', synthesis.methodMap || [], item =>
+        `- **${item.method || ''}:** ${item.description || ''}${markdownEvidence(item.evidence)}`
+    );
+    markdown += markdownAgentItems('局限与证据边界', synthesis.limitations || [], item => `- ${item}`);
+    markdown += markdownAgentItems('后续方向', synthesis.futureDirections || [], item => `- ${item}`);
+
+    const evaluation = result.evaluation || {};
+    if (Object.keys(evaluation).length) {
+        markdown += `## 质量评估\n\n`;
+        markdown += `- 评分：${evaluation.score || 0}/100\n`;
+        markdown += `- 覆盖状态：${evaluation.coverageLabel || evaluation.coverageLevel || ''}\n`;
+        markdown += `- 证据论文：${evaluation.evidencePaperCount || 0} 篇\n`;
+        markdown += `- 空查询：${evaluation.zeroResultQueryCount || 0} 个\n`;
+        markdown += `- 宽松重试：${evaluation.relaxedQueryCount || 0} 次\n\n`;
+        markdown += markdownAgentItems('质量风险', evaluation.issues || [], item => `- ${item}`);
+        markdown += markdownAgentItems('优化建议', evaluation.recommendations || [], item => `- ${item}`);
+    }
+
+    const trajectory = result.trajectory || [];
+    if (trajectory.length) {
+        markdown += `## 执行轨迹\n\n`;
+        trajectory.forEach(step => {
+            markdown += `- **${step.index || ''}. ${step.title || ''}** [${step.type || 'step'} / ${step.status || 'success'}]`;
+            if (step.tool) markdown += ` Tool: ${step.tool}`;
+            if (step.outputSummary) markdown += `，${step.outputSummary}`;
+            markdown += `\n`;
+        });
+        markdown += `\n`;
+    }
+
+    markdown += `## 代表论文\n\n`;
+    (result.papers || []).forEach((paper, index) => {
+        markdown += `### ${index + 1}. ${paper.title || ''}\n\n`;
+        markdown += `- 作者：${asArray(paper.authors).join(', ')}  \n`;
+        markdown += `- 发布日期：${paper.published || ''}  \n`;
+        markdown += `- 分类：${paper.primaryCategory || ''}  \n`;
+        markdown += `- 链接：${paper.link || paper.pdfLink || ''}  \n`;
+        markdown += `- 命中角度：${asArray(paper.matchAngles).join('、')}\n\n`;
+        markdown += `${paper.abstract || ''}\n\n`;
+    });
+
+    markdown += `\n*Generated by PaperExpress Research Agent*\n`;
+
+    const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `ResearchAgent_${date.replace(/\//g, '-')}.md`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
+
+function markdownEvidence(evidence) {
+    const items = asArray(evidence);
+    return items.length ? `（证据: ${items.map(item => `#${item}`).join(', ')}）` : '';
+}
+
+function markdownAgentItems(title, items, renderItem) {
+    const values = asArray(items);
+    if (!values.length) return '';
+    return `## ${title}\n\n${values.map(renderItem).join('\n')}\n\n`;
 }
 
 // 渲染数学公式（避免无限递归）
@@ -1222,15 +1834,17 @@ function closeHistoryModal() {
 function renderHistoryContent(container, data) {
     const papers = data.papers || {};
     const intensive = data.intensive || {};
+    const agent = data.agent || {};
 
     const papersKeys = Object.keys(papers);
     const intensiveKeys = Object.keys(intensive);
+    const agentKeys = Object.keys(agent);
 
-    if (papersKeys.length === 0 && intensiveKeys.length === 0) {
+    if (papersKeys.length === 0 && intensiveKeys.length === 0 && agentKeys.length === 0) {
         container.innerHTML = `
             <div class="history-empty">
                 <p>暂无历史记录</p>
-                <p class="history-empty-hint">执行论文速递或精读后，结果将自动保存</p>
+                <p class="history-empty-hint">执行论文速递、研究 Agent 或精读后，结果将自动保存</p>
             </div>
         `;
         return;
@@ -1264,6 +1878,38 @@ function renderHistoryContent(container, data) {
                     <div class="history-item-actions">
                         <button class="btn btn-small" onclick="loadPapersHistory('${key}')">加载</button>
                         <button class="btn btn-secondary btn-small" onclick="deletePapersHistory('${key}')">删除</button>
+                    </div>
+                </div>
+            `;
+        });
+
+        html += '</div>';
+    }
+
+    // 研究 Agent 记录
+    if (agentKeys.length > 0) {
+        html += '<h4>🧭 研究 Agent 记录</h4>';
+        html += '<div class="history-list">';
+
+        agentKeys.sort((a, b) => {
+            const dateA = agent[a].created || '';
+            const dateB = agent[b].created || '';
+            return dateB.localeCompare(dateA);
+        });
+
+        agentKeys.forEach(key => {
+            const record = agent[key];
+            const date = new Date(record.created).toLocaleString('zh-CN');
+            const count = record.count || 0;
+            html += `
+                <div class="history-item">
+                    <div class="history-item-info">
+                        <div class="history-item-title">${escapeHtml(record.title || '研究 Agent')}</div>
+                        <div class="history-item-meta">${date} · ${count} 篇论文 · ${escapeHtml(record.question || '')}</div>
+                    </div>
+                    <div class="history-item-actions">
+                        <button class="btn btn-small" onclick="loadAgentHistory('${key}')">加载</button>
+                        <button class="btn btn-secondary btn-small" onclick="deleteAgentHistory('${key}')">删除</button>
                     </div>
                 </div>
             `;
@@ -1379,6 +2025,61 @@ async function deletePapersHistory(hash) {
 
         if (data.success) {
             openHistoryModal(); // 刷新列表
+        } else {
+            alert('删除失败: ' + data.error);
+        }
+    } catch (error) {
+        alert('删除失败: ' + error.message);
+    }
+}
+
+async function loadAgentHistory(hash) {
+    try {
+        const response = await fetch(`${API_BASE}/api/history/agent/${hash}`);
+        const data = await response.json();
+
+        if (!data.success || !data.record) {
+            alert('加载失败: ' + (data.error || '记录不存在'));
+            return;
+        }
+
+        const record = data.record;
+        const result = record.result || {};
+        currentAgentResult = {
+            question: result.question || record.question || '',
+            intent: result.intent || {},
+            strategy: result.strategy || {},
+            subQueries: result.subQueries || [],
+            sourcePriorities: result.sourcePriorities || [],
+            papers: result.papers || [],
+            synthesis: result.synthesis || {},
+            evaluation: result.evaluation || {},
+            trajectory: result.trajectory || [],
+            stats: result.stats || {},
+            cached: true,
+            hash: hash,
+            cacheCreated: record.created || ''
+        };
+
+        closeHistoryModal();
+        renderAgentResults(currentAgentResult, true);
+        showSection('agentResults');
+    } catch (error) {
+        alert('加载失败: ' + error.message);
+    }
+}
+
+async function deleteAgentHistory(hash) {
+    if (!confirm('确定要删除这条研究 Agent 记录吗？')) return;
+
+    try {
+        const response = await fetch(`${API_BASE}/api/history/agent/${hash}`, {
+            method: 'DELETE'
+        });
+        const data = await response.json();
+
+        if (data.success) {
+            openHistoryModal();
         } else {
             alert('删除失败: ' + data.error);
         }
